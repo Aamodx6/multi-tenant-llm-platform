@@ -10,6 +10,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -30,6 +31,7 @@ from gateway.tenant_budget import (
     PriorityClass,
     TenantBudget,
 )
+from observability.metrics import MetricsRegistry
 
 _VNODE_COUNT = 64
 _PROM_METRIC_RE = re.compile(
@@ -460,6 +462,7 @@ class _RuntimeDeps:
     pool_health: PoolHealth
     engine: InferenceEngine
     admission: _PriorityAdmission
+    metrics: MetricsRegistry | None = None
     on_usage: Callable[[UsageEvent], None] | None = None
 
 
@@ -472,6 +475,10 @@ def _record_usage_and_reconcile(
     trace_id: str,
 ) -> None:
     deps.budget.reconcile(permit, total_tokens)
+    if deps.metrics is not None and total_tokens > 0:
+        deps.metrics.tokens_total.labels(tenant_id=permit.tenant_id, pool=pool_name).inc(
+            total_tokens
+        )
     if deps.on_usage is not None:
         deps.on_usage(
             UsageEvent(
@@ -498,6 +505,8 @@ def create_app(
     pool_health: PoolHealth,
     engine: InferenceEngine,
     admission_policy: AdmissionPolicy | None = None,
+    metrics: MetricsRegistry | None = None,
+    metrics_poll_interval_seconds: float | None = None,
     on_usage: Callable[[UsageEvent], None] | None = None,
 ) -> Starlette:
     """Create the unified RequestControl ASGI application."""
@@ -507,8 +516,36 @@ def create_app(
         pool_health=pool_health,
         engine=engine,
         admission=_PriorityAdmission(admission_policy or AdmissionPolicy()),
+        metrics=metrics,
         on_usage=on_usage,
     )
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+        scrape_fn = getattr(deps.engine, "scrape_metrics", None)
+        task: asyncio.Task[None] | None = None
+        if metrics_poll_interval_seconds is not None and callable(scrape_fn):
+
+            async def _poll_loop() -> None:
+                while True:
+                    await scrape_fn()
+                    await asyncio.sleep(metrics_poll_interval_seconds)
+
+            task = asyncio.create_task(_poll_loop())
+        try:
+            yield
+        finally:
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+    async def metrics_endpoint(_request: Request) -> Response:
+        active_metrics = deps.metrics or MetricsRegistry()
+        return Response(
+            content=active_metrics.render(),
+            media_type=active_metrics.content_type,
+        )
 
     async def chat_completions(request: Request) -> Response:
         trace_id = request.headers.get("x-trace-id") or uuid.uuid4().hex
@@ -549,6 +586,13 @@ def create_app(
                 code="invalid_api_key",
             )
         except BudgetExceededError as exc:
+            if deps.metrics is not None:
+                deps.metrics.rate_limited_total.labels(
+                    tenant_id="unknown", reason="budget_exceeded"
+                ).inc()
+                deps.metrics.requests_total.labels(
+                    pool=pool_spec.name, priority="unknown", status="429"
+                ).inc()
             return _error_response(
                 message=str(exc),
                 status_code=429,
@@ -557,10 +601,18 @@ def create_app(
                 headers={"Retry-After": str(exc.retry_after_seconds)},
             )
 
+        t_queue = time.perf_counter()
         try:
             await deps.admission.acquire(permit.priority)
         except _AdmissionShedError as exc:
             deps.budget.reconcile(permit, 0)
+            if deps.metrics is not None:
+                deps.metrics.rate_limited_total.labels(
+                    tenant_id=permit.tenant_id, reason="queue_shed"
+                ).inc()
+                deps.metrics.requests_total.labels(
+                    pool=pool_spec.name, priority=str(permit.priority), status="429"
+                ).inc()
             return _error_response(
                 message=str(exc),
                 status_code=429,
@@ -571,6 +623,10 @@ def create_app(
         except BaseException:
             deps.budget.reconcile(permit, 0)
             raise
+        if deps.metrics is not None:
+            deps.metrics.queue_wait_seconds.labels(priority=str(permit.priority)).observe(
+                max(0.0, time.perf_counter() - t_queue)
+            )
 
         target_pool, replica = _select_pool_and_replica(
             deps=deps,
@@ -580,6 +636,10 @@ def create_app(
         if replica is None:
             deps.admission.release()
             deps.budget.reconcile(permit, 0)
+            if deps.metrics is not None:
+                deps.metrics.requests_total.labels(
+                    pool=pool_spec.name, priority=str(permit.priority), status="503"
+                ).inc()
             return _error_response(
                 message="No healthy replicas available",
                 status_code=503,
@@ -588,6 +648,12 @@ def create_app(
                 headers={"Retry-After": "5"},
             )
 
+        if deps.metrics is not None and target_pool.name != pool_spec.name:
+            deps.metrics.fallback_total.labels(
+                from_pool=pool_spec.name, to_pool=target_pool.name
+            ).inc()
+
+        t_req = time.perf_counter()
         if req.stream:
             return _streaming_chat_response(
                 deps=deps,
@@ -598,6 +664,7 @@ def create_app(
                 replica=replica,
                 est_prompt=est_prompt,
                 trace_id=trace_id,
+                started_at=t_req,
             )
 
         try:
@@ -609,6 +676,14 @@ def create_app(
             )
         finally:
             deps.admission.release()
+
+        if deps.metrics is not None:
+            deps.metrics.ttft_seconds.labels(
+                pool=target_pool.name, priority=str(permit.priority)
+            ).observe(max(0.0, time.perf_counter() - t_req))
+            deps.metrics.requests_total.labels(
+                pool=target_pool.name, priority=str(permit.priority), status="200"
+            ).inc()
 
         total_tokens = result.prompt_tokens + result.completion_tokens
         _record_usage_and_reconcile(
@@ -640,7 +715,13 @@ def create_app(
             headers=_response_headers(target_pool.name, result.replica_id, trace_id),
         )
 
-    return Starlette(routes=[Route("/v1/chat/completions", chat_completions, methods=["POST"])])
+    return Starlette(
+        lifespan=lifespan,
+        routes=[
+            Route("/v1/chat/completions", chat_completions, methods=["POST"]),
+            Route("/metrics", metrics_endpoint, methods=["GET"]),
+        ],
+    )
 
 
 def _streaming_chat_response(
@@ -653,6 +734,7 @@ def _streaming_chat_response(
     replica: ReplicaEndpoint,
     est_prompt: int,
     trace_id: str,
+    started_at: float = 0.0,
 ) -> StreamingResponse:
     include_usage = bool(
         req.stream_options and req.stream_options.get("include_usage", False)
@@ -663,6 +745,7 @@ def _streaming_chat_response(
         completed = False
         emitted_tokens = 0
         actual_prompt_tokens: int | None = None
+        recorded_ttft = False
         stream_iter = deps.engine.stream(
             replica=replica,
             model_id=target_pool.model_id,
@@ -673,6 +756,17 @@ def _streaming_chat_response(
             async for chunk in stream_iter:
                 if await request.is_disconnected():
                     break
+                should_record_ttft = (
+                    not recorded_ttft
+                    and bool(chunk.delta)
+                    and deps.metrics is not None
+                    and started_at > 0
+                )
+                if should_record_ttft and deps.metrics is not None:
+                    deps.metrics.ttft_seconds.labels(
+                        pool=target_pool.name, priority=str(permit.priority)
+                    ).observe(max(0.0, time.perf_counter() - started_at))
+                    recorded_ttft = True
                 emitted_tokens = chunk.completion_tokens_so_far
                 if chunk.prompt_tokens is not None:
                     actual_prompt_tokens = chunk.prompt_tokens
@@ -699,6 +793,10 @@ def _streaming_chat_response(
                 yield f"data: {json.dumps(payload)}\n\n"
             else:
                 completed = True
+                if deps.metrics is not None:
+                    deps.metrics.requests_total.labels(
+                        pool=target_pool.name, priority=str(permit.priority), status="200"
+                    ).inc()
                 if include_usage:
                     prompt_used = (
                         actual_prompt_tokens if actual_prompt_tokens is not None else est_prompt

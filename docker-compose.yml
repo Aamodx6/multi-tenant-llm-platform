@@ -1,0 +1,55 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  request-control:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CATALOG_PATH: /app/catalog/pools.yaml
+      VLLM_ENDPOINTS: '{"pool-8b":["http://vllm-local:8000"],"pool-fallback":["http://vllm-local:8000"]}'
+    depends_on:
+      - redis
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/generated/prometheus-scrape.yaml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/generated/prometheus-alerts.yaml:/etc/prometheus/alerts.yaml:ro
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+
+  vllm-local:
+    image: vllm/vllm-openai:v0.7.3
+    profiles: ["gpu"]
+    ports:
+      - "8000:8000"
+    ipc: host
+    command:
+      - --model
+      - Qwen/Qwen2.5-1.5B-Instruct
+      - --dtype
+      - auto
+      - --max-model-len
+      - "4096"
+      - --gpu-memory-utilization
+      - "0.85"
+      - --enable-prefix-caching
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

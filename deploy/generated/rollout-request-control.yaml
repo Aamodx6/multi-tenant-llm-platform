@@ -1,0 +1,53 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: request-control
+  namespace: llm
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: request-control
+  strategy:
+    canary:
+      steps:
+      - setWeight: 5
+      - pause:
+          duration: 2m
+      - setWeight: 25
+      - analysis:
+          templates:
+          - templateName: request-control-ttft-slo
+      - setWeight: 100
+  template:
+    metadata:
+      labels:
+        app: request-control
+    spec:
+      containers:
+      - name: request-control
+        image: ghcr.io/multi-tenant-llm/request-control:latest
+        ports:
+        - containerPort: 8080
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 10001
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: request-control-ttft-slo
+  namespace: llm
+spec:
+  metrics:
+  - name: p95-ttft-under-1s
+    interval: 30s
+    count: 4
+    successCondition: result[0] <= 1.0
+    provider:
+      prometheus:
+        address: http://prometheus-operated.monitoring:9090
+        query: histogram_quantile(0.95, sum(rate(gateway_ttft_seconds_bucket[2m]))
+          by (le))

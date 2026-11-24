@@ -1,0 +1,26 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: keda-pool-fallback
+  namespace: llm
+spec:
+  scaleTargetRef:
+    name: vllm-pool-fallback
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: 0
+  maxReplicaCount: 2
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-operated.monitoring:9090
+      metricName: vllm_requests_waiting
+      query: sum(vllm:num_requests_waiting{model_name="Qwen/Qwen2.5-1.5B-Instruct"})
+      threshold: '6'
+      activationThreshold: '1'
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-operated.monitoring:9090
+      metricName: vllm_kv_cache_usage
+      query: avg(vllm:kv_cache_usage_perc{model_name="Qwen/Qwen2.5-1.5B-Instruct"})
+      threshold: '0.85'

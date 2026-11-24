@@ -1,0 +1,50 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+from pathlib import Path
+
+from bench.runner import BenchmarkReport, BenchmarkRunner, WorkloadProfile
+
+
+def main() -> int:
+    """Run a workload benchmark from CLI flags and optionally gate against a baseline JSON."""
+    parser = argparse.ArgumentParser(description="Multi-Tenant LLM Platform Benchmark Runner")
+    parser.add_argument("--name", default="ad-hoc")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8080")
+    parser.add_argument("--api-key", required=True)
+    parser.add_argument("--model", default="qwen-7b")
+    parser.add_argument("--num-requests", type=int, default=40)
+    parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--gpu-hourly-usd", type=float, default=0.50)
+    parser.add_argument("--baseline-json", type=Path, default=None)
+    parser.add_argument("--out-json", type=Path, default=None)
+    args = parser.parse_args()
+
+    profile = WorkloadProfile(
+        name=args.name,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        model=args.model,
+        num_requests=args.num_requests,
+        concurrency=args.concurrency,
+        max_tokens=args.max_tokens,
+        gpu_hourly_usd=args.gpu_hourly_usd,
+    )
+    baseline: BenchmarkReport | None = None
+    if args.baseline_json is not None and args.baseline_json.exists():
+        baseline = BenchmarkReport.model_validate_json(args.baseline_json.read_text("utf-8"))
+
+    verdict = asyncio.run(BenchmarkRunner().run(profile, baseline=baseline))
+    output = json.dumps(verdict.model_dump(), indent=2)
+    print(output)
+    if args.out_json is not None:
+        args.out_json.parent.mkdir(parents=True, exist_ok=True)
+        args.out_json.write_text(output, encoding="utf-8")
+    return 0 if verdict.passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

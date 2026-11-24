@@ -1,0 +1,77 @@
+{
+  "title": "Multi-Tenant LLM Serving Platform",
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "id": 1,
+      "title": "p95 TTFT by Pool (vLLM & Gateway)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(gateway_ttft_seconds_bucket[5m])) by (le, pool))"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(vllm:time_to_first_token_seconds_bucket[5m])) by (le, model_name))"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "vLLM Queue Depth & KV Cache Usage",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "vllm:num_requests_waiting"
+        },
+        {
+          "expr": "vllm:kv_cache_usage_perc"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "DCGM GPU Utilization, Temp & XID Errors",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_UTIL"
+        },
+        {
+          "expr": "DCGM_FI_DEV_GPU_TEMP"
+        },
+        {
+          "expr": "DCGM_FI_DEV_XID_ERRORS"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Gateway Tokens/s, 429 Shedding & Fallback Rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum(rate(gateway_tokens_total[1m])) by (tenant_id, pool)"
+        },
+        {
+          "expr": "sum(rate(gateway_429_total[1m])) by (tenant_id, reason)"
+        },
+        {
+          "expr": "sum(rate(gateway_fallback_total[1m])) by (from_pool, to_pool)"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "AIOps Anomaly Score & Remediation Actions",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "aiops_anomaly_score"
+        },
+        {
+          "expr": "sum(increase(aiops_remediation_actions_total[15m])) by (kind, outcome)"
+        }
+      ]
+    }
+  ]
+}

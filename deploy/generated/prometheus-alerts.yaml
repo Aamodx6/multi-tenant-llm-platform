@@ -1,0 +1,110 @@
+groups:
+- name: llm-platform-slo-burn-rate
+  rules:
+  - alert: PoolHighTTFT_pool-8b
+    expr: histogram_quantile(0.95, sum(rate(gateway_ttft_seconds_bucket{pool="pool-8b"}[5m]))
+      by (le)) > 1.000
+    for: 5m
+    labels:
+      severity: warning
+      pool: pool-8b
+    annotations:
+      summary: p95 TTFT breached 1000ms SLO on pool-8b
+  - alert: PoolErrorBudgetFastBurnRate_pool-8b
+    expr: (sum(rate(gateway_requests_total{pool="pool-8b",status=~"5.."}[5m])) / clamp_min(sum(rate(gateway_requests_total{pool="pool-8b"}[5m])),
+      1e-6)) > 0.072000 and (sum(rate(gateway_requests_total{pool="pool-8b",status=~"5.."}[1h]))
+      / clamp_min(sum(rate(gateway_requests_total{pool="pool-8b"}[1h])), 1e-6)) >
+      0.072000
+    labels:
+      severity: critical
+      pool: pool-8b
+    annotations:
+      summary: Fast error-budget burn rate on pool-8b (14.4x over 5m & 1h)
+  - alert: PoolErrorBudgetSlowBurnRate_pool-8b
+    expr: (sum(rate(gateway_requests_total{pool="pool-8b",status=~"5.."}[30m])) /
+      clamp_min(sum(rate(gateway_requests_total{pool="pool-8b"}[30m])), 1e-6)) > 0.030000
+      and (sum(rate(gateway_requests_total{pool="pool-8b",status=~"5.."}[6h])) / clamp_min(sum(rate(gateway_requests_total{pool="pool-8b"}[6h])),
+      1e-6)) > 0.030000
+    labels:
+      severity: warning
+      pool: pool-8b
+    annotations:
+      summary: Slow error-budget burn rate on pool-8b (6x over 30m & 6h)
+  - alert: PoolHighTTFT_pool-8b-awq
+    expr: histogram_quantile(0.95, sum(rate(gateway_ttft_seconds_bucket{pool="pool-8b-awq"}[5m]))
+      by (le)) > 1.000
+    for: 5m
+    labels:
+      severity: warning
+      pool: pool-8b-awq
+    annotations:
+      summary: p95 TTFT breached 1000ms SLO on pool-8b-awq
+  - alert: PoolErrorBudgetFastBurnRate_pool-8b-awq
+    expr: (sum(rate(gateway_requests_total{pool="pool-8b-awq",status=~"5.."}[5m]))
+      / clamp_min(sum(rate(gateway_requests_total{pool="pool-8b-awq"}[5m])), 1e-6))
+      > 0.072000 and (sum(rate(gateway_requests_total{pool="pool-8b-awq",status=~"5.."}[1h]))
+      / clamp_min(sum(rate(gateway_requests_total{pool="pool-8b-awq"}[1h])), 1e-6))
+      > 0.072000
+    labels:
+      severity: critical
+      pool: pool-8b-awq
+    annotations:
+      summary: Fast error-budget burn rate on pool-8b-awq (14.4x over 5m & 1h)
+  - alert: PoolErrorBudgetSlowBurnRate_pool-8b-awq
+    expr: (sum(rate(gateway_requests_total{pool="pool-8b-awq",status=~"5.."}[30m]))
+      / clamp_min(sum(rate(gateway_requests_total{pool="pool-8b-awq"}[30m])), 1e-6))
+      > 0.030000 and (sum(rate(gateway_requests_total{pool="pool-8b-awq",status=~"5.."}[6h]))
+      / clamp_min(sum(rate(gateway_requests_total{pool="pool-8b-awq"}[6h])), 1e-6))
+      > 0.030000
+    labels:
+      severity: warning
+      pool: pool-8b-awq
+    annotations:
+      summary: Slow error-budget burn rate on pool-8b-awq (6x over 30m & 6h)
+  - alert: PoolHighTTFT_pool-fallback
+    expr: histogram_quantile(0.95, sum(rate(gateway_ttft_seconds_bucket{pool="pool-fallback"}[5m]))
+      by (le)) > 0.600
+    for: 5m
+    labels:
+      severity: warning
+      pool: pool-fallback
+    annotations:
+      summary: p95 TTFT breached 600ms SLO on pool-fallback
+  - alert: PoolErrorBudgetFastBurnRate_pool-fallback
+    expr: (sum(rate(gateway_requests_total{pool="pool-fallback",status=~"5.."}[5m]))
+      / clamp_min(sum(rate(gateway_requests_total{pool="pool-fallback"}[5m])), 1e-6))
+      > 0.144000 and (sum(rate(gateway_requests_total{pool="pool-fallback",status=~"5.."}[1h]))
+      / clamp_min(sum(rate(gateway_requests_total{pool="pool-fallback"}[1h])), 1e-6))
+      > 0.144000
+    labels:
+      severity: critical
+      pool: pool-fallback
+    annotations:
+      summary: Fast error-budget burn rate on pool-fallback (14.4x over 5m & 1h)
+  - alert: PoolErrorBudgetSlowBurnRate_pool-fallback
+    expr: (sum(rate(gateway_requests_total{pool="pool-fallback",status=~"5.."}[30m]))
+      / clamp_min(sum(rate(gateway_requests_total{pool="pool-fallback"}[30m])), 1e-6))
+      > 0.060000 and (sum(rate(gateway_requests_total{pool="pool-fallback",status=~"5.."}[6h]))
+      / clamp_min(sum(rate(gateway_requests_total{pool="pool-fallback"}[6h])), 1e-6))
+      > 0.060000
+    labels:
+      severity: warning
+      pool: pool-fallback
+    annotations:
+      summary: Slow error-budget burn rate on pool-fallback (6x over 30m & 6h)
+- name: llm-platform-gpu-health
+  rules:
+  - alert: DCGMXidError
+    expr: increase(DCGM_FI_DEV_XID_ERRORS[5m]) > 0
+    for: 0m
+    labels:
+      severity: critical
+    annotations:
+      summary: GPU XID error detected on node
+  - alert: VLLMKVCacheSaturated
+    expr: vllm:kv_cache_usage_perc > 0.95
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: vLLM KV cache usage above 95%

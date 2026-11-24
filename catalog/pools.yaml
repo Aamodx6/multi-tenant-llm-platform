@@ -1,0 +1,52 @@
+pools:
+  pool-8b:
+    model_id: Qwen/Qwen2.5-7B-Instruct
+    engine: vllm
+    quantization: fp16
+    isolation: shared
+    fallback_pool: pool-fallback
+    max_model_len: 8192
+    gpu_memory_utilization: 0.90
+    enable_prefix_caching: true
+    min_replicas: 1
+    max_replicas: 4
+    keda_waiting_threshold: 4
+    keda_kv_cache_threshold: 0.80
+    slo_p95_ttft_ms: 1000
+    slo_availability: 0.995
+    aliases:
+      - qwen-7b
+      - default
+  pool-8b-awq:
+    model_id: Qwen/Qwen2.5-7B-Instruct-AWQ
+    engine: vllm
+    quantization: awq
+    isolation: shared
+    fallback_pool: pool-fallback
+    max_model_len: 8192
+    gpu_memory_utilization: 0.90
+    enable_prefix_caching: true
+    min_replicas: 1
+    max_replicas: 4
+    keda_waiting_threshold: 4
+    keda_kv_cache_threshold: 0.80
+    slo_p95_ttft_ms: 1000
+    slo_availability: 0.995
+    aliases:
+      - qwen-7b-awq
+  pool-fallback:
+    model_id: Qwen/Qwen2.5-1.5B-Instruct
+    engine: vllm
+    quantization: fp16
+    isolation: fallback
+    max_model_len: 4096
+    gpu_memory_utilization: 0.85
+    enable_prefix_caching: true
+    min_replicas: 0
+    max_replicas: 2
+    keda_waiting_threshold: 6
+    keda_kv_cache_threshold: 0.85
+    slo_p95_ttft_ms: 600
+    slo_availability: 0.99
+    aliases:
+      - qwen-1.5b

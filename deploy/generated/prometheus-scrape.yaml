@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s
+scrape_configs:
+- job_name: request-control
+  static_configs:
+  - targets:
+    - request-control:8080
+- job_name: vllm-engines
+  static_configs:
+  - targets:
+    - vllm-pool-8b:8000
+    - vllm-pool-fallback:8000
+- job_name: dcgm-exporter
+  static_configs:
+  - targets:
+    - dcgm-exporter:9400

@@ -1,0 +1,25 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: keda-pool-8b-awq
+  namespace: llm
+spec:
+  scaleTargetRef:
+    name: vllm-pool-8b-awq
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-operated.monitoring:9090
+      metricName: vllm_requests_waiting
+      query: sum(vllm:num_requests_waiting{model_name="Qwen/Qwen2.5-7B-Instruct-AWQ"})
+      threshold: '4'
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-operated.monitoring:9090
+      metricName: vllm_kv_cache_usage
+      query: avg(vllm:kv_cache_usage_perc{model_name="Qwen/Qwen2.5-7B-Instruct-AWQ"})
+      threshold: '0.80'

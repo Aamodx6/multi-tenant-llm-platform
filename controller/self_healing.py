@@ -10,6 +10,7 @@ from typing import Protocol
 from sklearn.ensemble import IsolationForest
 
 from gateway.pool_health import PoolHealth
+from observability.metrics import MetricsRegistry
 
 
 class ActionKind(StrEnum):
@@ -236,6 +237,7 @@ class SelfHealingEngine:
         kv_cache_threshold: float = 0.95,
         z_score_threshold: float = 3.5,
         baseline_features: Sequence[TelemetryFeature] | None = None,
+        metrics: MetricsRegistry | None = None,
     ) -> None:
         self._actuator = actuator
         self._pool_health = pool_health
@@ -243,6 +245,7 @@ class SelfHealingEngine:
         self._thermal_threshold_c = thermal_threshold_c
         self._kv_threshold = kv_cache_threshold
         self._z_score_threshold = z_score_threshold
+        self._metrics = metrics
         self._iso_forest: IsolationForest | None = None
         if baseline_features and len(baseline_features) >= 5:
             model = IsolationForest(contamination=0.05, random_state=42)
@@ -275,6 +278,8 @@ class SelfHealingEngine:
         for pod in window.pods:
             z = compute_z_score(pod.ttft_ms_series)
             scores[pod.pod] = z
+            if self._metrics is not None:
+                self._metrics.anomaly_score.labels(pod=pod.pod, pool=pod.pool).set(z)
             has_hw_fault = (
                 pod.xid_errors > 0
                 or pod.ecc_errors > 0
@@ -335,10 +340,18 @@ class SelfHealingEngine:
                     PlannedAction(kind=kind, target=target, reason=reason, executed=True)
                 )
                 audit_log.append(AuditEntry("executed", kind, target, reason))
+                if self._metrics is not None:
+                    self._metrics.remediation_actions_total.labels(
+                        kind=str(kind), outcome="executed"
+                    ).inc()
             except RuntimeError as exc:
                 fails = guardrails.failure_counts.get(key, 0) + 1
                 guardrails.failure_counts[key] = fails
                 audit_log.append(AuditEntry("failed", kind, target, f"attempt_{fails}:{exc}"))
+                if self._metrics is not None:
+                    self._metrics.remediation_actions_total.labels(
+                        kind=str(kind), outcome="failed"
+                    ).inc()
                 if fails >= guardrails.max_failures_before_page:
                     esc_reason = f"{kind}_failed_{fails}_times"
                     self._actuator.page_human(target, esc_reason)
