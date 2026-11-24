@@ -4,6 +4,7 @@ import json
 import os
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import redis
 from starlette.applications import Starlette
@@ -73,24 +74,33 @@ def create_default_app() -> Starlette:
     keys_by_hash = _load_tenants()
 
     redis_url = os.environ.get("REDIS_URL")
+    gateway_replicas = int(os.environ.get("GATEWAY_REPLICAS", "1"))
+    is_production = os.environ.get("ENVIRONMENT", "").lower() == "production"
+    raw_salt_secret = os.environ.get("CACHE_SALT_SECRET")
+    if (is_production or gateway_replicas > 1) and not raw_salt_secret:
+        raise RuntimeError(
+            "CACHE_SALT_SECRET must be set in production or multi-replica gateway deployments."
+        )
+    cache_salt_secret = raw_salt_secret.encode("utf-8") if raw_salt_secret else None
+
     budget_adapter: BudgetAdapter
     pool_health: PoolHealth
     on_usage: Callable[[UsageEvent], None] | None = None
+    on_usage_flush: Callable[[], Any] | None = None
     if redis_url:
         client = redis.Redis.from_url(redis_url, decode_responses=True)
         budget_adapter = RedisPostgresAdapter(
             redis_client=client,
             pg_lookup=keys_by_hash.get,
-            gateway_replicas=int(os.environ.get("GATEWAY_REPLICAS", "1")),
+            gateway_replicas=gateway_replicas,
         )
         pool_health = RedisPoolHealthAdapter(redis_client=client)
-        on_usage = RedisStreamUsageSink(redis_client=client).emit
+        usage_sink = RedisStreamUsageSink(redis_client=client)
+        on_usage = usage_sink.emit
+        on_usage_flush = usage_sink.flush
     else:
         budget_adapter = InMemoryBudgetAdapter(keys_by_hash)
         pool_health = PoolHealthStore()
-
-    raw_salt_secret = os.environ.get("CACHE_SALT_SECRET")
-    cache_salt_secret = raw_salt_secret.encode("utf-8") if raw_salt_secret else None
 
     poll_interval = float(os.environ.get("METRICS_POLL_INTERVAL_SECONDS", "5.0"))
     return create_app(
@@ -101,6 +111,7 @@ def create_default_app() -> Starlette:
         metrics=MetricsRegistry(),
         metrics_poll_interval_seconds=poll_interval if poll_interval > 0 else None,
         on_usage=on_usage,
+        on_usage_flush=on_usage_flush,
         cache_salt_secret=cache_salt_secret,
     )
 

@@ -42,6 +42,24 @@ spec:
   - alias: al2023@latest
   role: llm-prod-eks-karpenter-node
   instanceStorePolicy: RAID0
+  userData: 'MIME-Version: 1.0
+
+    Content-Type: multipart/mixed; boundary="//"
+
+
+    --//
+
+    Content-Type: text/x-shellscript; charset="us-ascii"
+
+
+    #!/bin/sh
+
+    if [ -d /mnt/k8s-disks/0 ] && [ ! -e /mnt/nvme ]; then ln -sfn /mnt/k8s-disks/0
+    /mnt/nvme; fi
+
+    --//--
+
+    '
   subnetSelectorTerms:
   - tags:
       karpenter.sh/discovery: llm-prod-eks

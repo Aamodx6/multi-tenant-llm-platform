@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 from collections import defaultdict, deque
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -59,6 +59,7 @@ def _event_to_fields(event: UsageEvent) -> dict[str, str]:
         completion_tokens = event.tokens
     recorded_at_ms = event.recorded_at_ms or int(time.time() * 1000)
     return {
+        "event_id": event.event_id or event.trace_id,
         "trace_id": event.trace_id,
         "tenant_id": event.tenant_id,
         "pool": event.pool,
@@ -90,7 +91,8 @@ class RedisStreamUsageSink:
         """Append a UsageEvent to Redis Streams, buffering briefly on transient errors."""
         fields = _event_to_fields(event)
         try:
-            self.flush()
+            if self._pending_buffer:
+                self.flush(limit=64)
             self._redis.xadd(
                 self.stream_key,
                 fields,  # type: ignore[arg-type]
@@ -100,20 +102,25 @@ class RedisStreamUsageSink:
         except redis.RedisError:
             self._pending_buffer.append(fields)
 
-    def flush(self) -> int:
-        """Flush any buffered fallback events to Redis Streams."""
-        flushed = 0
-        while self._pending_buffer:
-            fields = self._pending_buffer[0]
-            self._redis.xadd(
+    def flush(self, *, limit: int | None = None) -> int:
+        """Flush buffered fallback events to Redis Streams in one pipelined round-trip."""
+        pending = len(self._pending_buffer)
+        if not pending:
+            return 0
+        count = pending if limit is None else min(limit, pending)
+        batch = [self._pending_buffer[i] for i in range(count)]
+        pipe = self._redis.pipeline(transaction=False)
+        for fields in batch:
+            pipe.xadd(
                 self.stream_key,
                 fields,  # type: ignore[arg-type]
                 maxlen=self._maxlen,
                 approximate=True,
             )
+        pipe.execute()
+        for _ in range(count):
             self._pending_buffer.popleft()
-            flushed += 1
-        return flushed
+        return count
 
 
 class BillingRollupWorker:
@@ -190,7 +197,7 @@ class BillingRollupWorker:
             entries.extend(stream_entries)
         return entries
 
-    def _process_entries(self, entries: list[tuple[str, Mapping[str, Any]]]) -> int:
+    def _process_entries(self, entries: Sequence[tuple[str, Mapping[str, Any] | None]]) -> int:
         message_ids: list[str] = []
         parsed_events: list[dict[str, Any]] = []
         now = datetime.now(tz=UTC)
@@ -198,27 +205,38 @@ class BillingRollupWorker:
         for raw_id, fields in entries:
             msg_id = raw_id.decode("utf-8") if isinstance(raw_id, bytes) else str(raw_id)
             message_ids.append(msg_id)
+            if fields is None:
+                continue
             decoded = {
                 (k.decode("utf-8") if isinstance(k, bytes) else str(k)): (
                     v.decode("utf-8") if isinstance(v, bytes) else str(v)
                 )
                 for k, v in fields.items()
             }
-            ts_ms = int(decoded.get("recorded_at_ms", "0") or 0)
-            dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=UTC) if ts_ms > 0 else now
-            bucket_hour = dt.replace(minute=0, second=0, microsecond=0)
-            parsed_events.append(
-                {
-                    "trace_id": decoded["trace_id"],
-                    "tenant_id": decoded["tenant_id"],
-                    "pool": decoded["pool"],
-                    "lora_name": decoded.get("lora_name", ""),
-                    "bucket_hour": bucket_hour,
-                    "prompt_tokens": int(decoded.get("prompt_tokens", "0")),
-                    "completion_tokens": int(decoded.get("completion_tokens", "0")),
-                    "total_tokens": int(decoded.get("total_tokens", "0")),
-                }
-            )
+            try:
+                dedup_id = decoded.get("event_id") or decoded["trace_id"]
+                ts_ms = int(decoded.get("recorded_at_ms", "0") or 0)
+                dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=UTC) if ts_ms > 0 else now
+                bucket_hour = dt.replace(minute=0, second=0, microsecond=0)
+                parsed_events.append(
+                    {
+                        "trace_id": dedup_id,
+                        "tenant_id": decoded["tenant_id"],
+                        "pool": decoded["pool"],
+                        "lora_name": decoded.get("lora_name", ""),
+                        "bucket_hour": bucket_hour,
+                        "prompt_tokens": int(decoded.get("prompt_tokens", "0")),
+                        "completion_tokens": int(decoded.get("completion_tokens", "0")),
+                        "total_tokens": int(decoded.get("total_tokens", "0")),
+                    }
+                )
+            except (KeyError, ValueError, TypeError):
+                continue
+
+        if not parsed_events:
+            if message_ids:
+                self._redis.xack(self.stream_key, self.group_name, *message_ids)
+            return 0
 
         dedup_count = 0
         with self._db_engine.begin() as conn:
@@ -228,7 +246,7 @@ class BillingRollupWorker:
                 "VALUES (:trace_id, :created_at) "
                 "ON CONFLICT (trace_id) DO NOTHING RETURNING trace_id"
             ).bindparams(bindparam("created_at", type_=DateTime(timezone=True)))
-            for item in parsed_events:
+            for item in sorted(parsed_events, key=lambda row: str(row["trace_id"])):
                 inserted = conn.execute(
                     dedup_stmt, {"trace_id": item["trace_id"], "created_at": now}
                 ).fetchone()
@@ -276,7 +294,7 @@ class BillingRollupWorker:
                     bindparam("bucket_hour", type_=DateTime(timezone=True)),
                     bindparam("updated_at", type_=DateTime(timezone=True)),
                 )
-                for (tenant_id, pool, lora_name, bucket_hour), totals in agg.items():
+                for (tenant_id, pool, lora_name, bucket_hour), totals in sorted(agg.items()):
                     conn.execute(
                         rollup_stmt,
                         {

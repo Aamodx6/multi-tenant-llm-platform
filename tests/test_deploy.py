@@ -173,3 +173,9 @@ def test_prefetch_daemonset_wait_init_container_and_karpenter_raid0() -> None:
 
     karpenter_docs = list(yaml.safe_load_all(manifests["karpenter-gpu.yaml"]))
     assert karpenter_docs[1]["spec"]["instanceStorePolicy"] == "RAID0"
+    assert "/mnt/nvme" in karpenter_docs[1]["spec"]["userData"]
+
+    rollout_docs = list(yaml.safe_load_all(manifests["rollout-request-control.yaml"]))
+    rc_env = rollout_docs[2]["spec"]["template"]["spec"]["containers"][0]["env"]
+    assert any(item["name"] == "CACHE_SALT_SECRET" for item in rc_env)
+    assert "copy-s5cmd" in [c["name"] for c in ds_spec["initContainers"]]

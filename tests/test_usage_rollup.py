@@ -135,3 +135,49 @@ def test_billing_rollup_worker_xautoclaim_recovers_stale_pending_and_skips_xack_
             text("SELECT total_tokens, request_count FROM tenant_usage_hourly")
         ).fetchone()
     assert total == (90, 1)
+
+
+def test_caller_reused_trace_id_cannot_bypass_billing_and_trimmed_entries_do_not_crash() -> None:
+    redis_client = fakeredis.FakeRedis(decode_responses=True)
+    db_engine = create_engine("sqlite:///:memory:")
+    sink = RedisStreamUsageSink(redis_client=redis_client)
+
+    # Same caller trace_id, distinct server-generated event_id per completion
+    msg_a = UsageEvent(
+        trace_id="attacker-trace-id",
+        event_id="evt-1",
+        tenant_id="tenant-a",
+        pool="pool-8b",
+        tokens=40,
+        prompt_tokens=20,
+        completion_tokens=20,
+    )
+    msg_b = UsageEvent(
+        trace_id="attacker-trace-id",
+        event_id="evt-2",
+        tenant_id="tenant-a",
+        pool="pool-8b",
+        tokens=60,
+        prompt_tokens=30,
+        completion_tokens=30,
+    )
+    sink.emit(msg_a)
+    sink.emit(msg_b)
+
+    worker = BillingRollupWorker(
+        redis_client=redis_client,
+        db_engine=db_engine,
+        consumer_name="worker-a",
+    )
+    worker.ensure_schema()
+    assert worker.run_once() == 2
+
+    # Simulated trimmed entry (msg_id, None) from XAUTOCLAIM must be ignored + XACKed cleanly
+    trimmed = worker._process_entries([("9999999999999-0", None)])
+    assert trimmed == 0
+
+    with db_engine.connect() as conn:
+        total = conn.execute(
+            text("SELECT total_tokens, request_count FROM tenant_usage_hourly")
+        ).fetchone()
+    assert total == (100, 2)

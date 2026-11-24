@@ -937,3 +937,50 @@ pools:
     assert salt_b != "attacker-forged-salt"
     assert salt_a != salt_b
     assert "cache_salt" not in seen_payloads[2]
+
+
+@pytest.mark.anyio
+async def test_vllm_adapter_singleflight_and_reloads_lora_on_404() -> None:
+    load_calls: list[dict[str, Any]] = []
+    chat_attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal chat_attempts
+        if request.url.path == "/v1/load_lora_adapter":
+            load_calls.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"status": "loaded"})
+        chat_attempts += 1
+        if chat_attempts == 1:
+            return httpx.Response(404, json={"error": {"message": "adapter evicted"}})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "reloaded-ok"}}],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+            },
+        )
+
+    rep = ReplicaEndpoint("8b-0", "http://vllm-0:8000")
+    vllm = VLLMAdapter(
+        replicas={"pool-8b": [rep]},
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    await asyncio.gather(
+        vllm.ensure_lora_loaded(
+            replica=rep, lora_name="tenant-a-sql", lora_path="/models/loras/pool-8b/tenant-a-sql"
+        ),
+        vllm.ensure_lora_loaded(
+            replica=rep, lora_name="tenant-a-sql", lora_path="/models/loras/pool-8b/tenant-a-sql"
+        ),
+    )
+    assert len(load_calls) == 1
+
+    res = await vllm.complete(
+        replica=rep,
+        model_id="tenant-a-sql",
+        request_id="req-1",
+        payload={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert res.content == "reloaded-ok"
+    assert len(load_calls) == 2
+    assert chat_attempts == 2

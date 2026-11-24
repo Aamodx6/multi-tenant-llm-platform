@@ -287,8 +287,9 @@ class VLLMAdapter:
         self._client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
         )
-        self._active_streams: dict[str, httpx.Response] = {}
+        self._active_streams: dict[str, list[httpx.Response]] = {}
         self._loaded_loras: set[tuple[str, str]] = set()
+        self._lora_paths: dict[tuple[str, str], str] = {}
         self._lora_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     async def ensure_lora_loaded(
@@ -296,6 +297,7 @@ class VLLMAdapter:
     ) -> None:
         """Load a dynamic LoRA adapter onto a vLLM replica once using singleflight locking."""
         key = (replica.replica_id, lora_name)
+        self._lora_paths[key] = lora_path
         if key in self._loaded_loras:
             return
         lock = self._lora_locks.setdefault(key, asyncio.Lock())
@@ -308,6 +310,15 @@ class VLLMAdapter:
             )
             resp.raise_for_status()
             self._loaded_loras.add(key)
+
+    async def _reload_lora_on_404(self, replica: ReplicaEndpoint, model_id: str) -> bool:
+        key = (replica.replica_id, model_id)
+        lora_path = self._lora_paths.get(key)
+        if lora_path is None:
+            return False
+        self._loaded_loras.discard(key)
+        await self.ensure_lora_loaded(replica=replica, lora_name=model_id, lora_path=lora_path)
+        return True
 
     def list_replicas(self, pool: str) -> list[ReplicaEndpoint]:
         return list(self._replicas.get(pool, []))
@@ -346,6 +357,12 @@ class VLLMAdapter:
             json=body,
             headers={"x-request-id": request_id},
         )
+        if resp.status_code == 404 and await self._reload_lora_on_404(replica, model_id):
+            resp = await self._client.post(
+                f"{replica.url}/v1/chat/completions",
+                json=body,
+                headers={"x-request-id": request_id},
+            )
         resp.raise_for_status()
         data = resp.json()
         usage = data.get("usage", {})
@@ -372,54 +389,68 @@ class VLLMAdapter:
             "stream_options": {"include_usage": True},
         }
         completion_count = 0
-        async with self._client.stream(
-            "POST",
-            f"{replica.url}/v1/chat/completions",
-            json=body,
-            headers={"x-request-id": request_id},
-        ) as resp:
-            resp.raise_for_status()
-            self._active_streams[request_id] = resp
-            try:
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    raw = line[6:].strip()
-                    if raw == "[DONE]":
-                        break
-                    event = json.loads(raw)
-                    usage = event.get("usage")
-                    choices = event.get("choices") or []
-                    if not choices:
-                        if isinstance(usage, dict):
-                            yield _make_stream_chunk(
-                                delta="",
-                                fallback_count=completion_count,
-                                usage=usage,
-                                finished=True,
-                                is_usage_only=True,
-                            )
-                        continue
-                    choice = choices[0]
-                    delta_obj = choice.get("delta") or {}
-                    delta_text = str(delta_obj.get("content") or "")
-                    if delta_text:
-                        completion_count += 1
-                    yield _make_stream_chunk(
-                        delta=delta_text,
-                        fallback_count=completion_count,
-                        usage=usage if isinstance(usage, dict) else None,
-                        finished=choice.get("finish_reason") is not None,
-                        role=delta_obj.get("role"),
-                    )
-            finally:
-                self._active_streams.pop(request_id, None)
+        for attempt in range(2):
+            async with self._client.stream(
+                "POST",
+                f"{replica.url}/v1/chat/completions",
+                json=body,
+                headers={"x-request-id": request_id},
+            ) as resp:
+                if (
+                    attempt == 0
+                    and resp.status_code == 404
+                    and await self._reload_lora_on_404(replica, model_id)
+                ):
+                    continue
+                resp.raise_for_status()
+                active = self._active_streams.setdefault(request_id, [])
+                active.append(resp)
+                try:
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        raw = line[6:].strip()
+                        if raw == "[DONE]":
+                            break
+                        event = json.loads(raw)
+                        usage = event.get("usage")
+                        choices = event.get("choices") or []
+                        if not choices:
+                            if isinstance(usage, dict):
+                                yield _make_stream_chunk(
+                                    delta="",
+                                    fallback_count=completion_count,
+                                    usage=usage,
+                                    finished=True,
+                                    is_usage_only=True,
+                                )
+                            continue
+                        choice = choices[0]
+                        delta_obj = choice.get("delta") or {}
+                        delta_text = str(delta_obj.get("content") or "")
+                        if delta_text:
+                            completion_count += 1
+                        yield _make_stream_chunk(
+                            delta=delta_text,
+                            fallback_count=completion_count,
+                            usage=usage if isinstance(usage, dict) else None,
+                            finished=choice.get("finish_reason") is not None,
+                            role=delta_obj.get("role"),
+                        )
+                finally:
+                    entries = self._active_streams.get(request_id)
+                    if entries is not None:
+                        with suppress(ValueError):
+                            entries.remove(resp)
+                        if not entries:
+                            self._active_streams.pop(request_id, None)
+                return
 
     async def abort(self, *, replica: ReplicaEndpoint, request_id: str) -> None:
         """Close the active upstream HTTP stream so vLLM cancels generation."""
         _ = replica
-        resp = self._active_streams.pop(request_id, None)
-        if resp is not None:
+        resps = self._active_streams.pop(request_id, [])
+        for resp in resps:
             await resp.aclose()
 
 
@@ -495,6 +526,7 @@ class UsageEvent:
     completion_tokens: int = 0
     lora_name: str | None = None
     recorded_at_ms: int = 0
+    event_id: str = ""
 
 
 @dataclass
@@ -536,6 +568,7 @@ def _record_usage_and_reconcile(
                 completion_tokens=completion_tokens,
                 lora_name=lora_name,
                 recorded_at_ms=int(time.time() * 1000),
+                event_id=uuid.uuid4().hex,
             )
         )
 
@@ -589,6 +622,7 @@ def create_app(
     metrics: MetricsRegistry | None = None,
     metrics_poll_interval_seconds: float | None = None,
     on_usage: Callable[[UsageEvent], None] | None = None,
+    on_usage_flush: Callable[[], Any] | None = None,
     cache_salt_secret: bytes | None = None,
 ) -> Starlette:
     """Create the unified RequestControl ASGI application."""
@@ -621,6 +655,9 @@ def create_app(
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
+            if on_usage_flush is not None:
+                with suppress(Exception):
+                    on_usage_flush()
 
     async def metrics_endpoint(_request: Request) -> Response:
         active_metrics = deps.metrics or MetricsRegistry()
@@ -760,6 +797,18 @@ def create_app(
                     replica=replica,
                     lora_name=lora_spec.name,
                     lora_path=f"/models/loras/{target_pool.name}/{lora_spec.name}",
+                )
+            except httpx.HTTPError as exc:
+                deps.admission.release()
+                deps.budget.reconcile(permit, 0)
+                _record_status(
+                    deps, pool=target_pool.name, priority=str(permit.priority), status="503"
+                )
+                return _error_response(
+                    message=f"Failed to load dynamic LoRA adapter: {exc}",
+                    status_code=503,
+                    error_type="server_error",
+                    code="lora_load_failed",
                 )
             except BaseException:
                 deps.admission.release()

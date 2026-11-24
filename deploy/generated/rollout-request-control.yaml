@@ -57,6 +57,12 @@ spec:
         image: ghcr.io/multi-tenant-llm/request-control:latest
         ports:
         - containerPort: 8080
+        env:
+        - name: CACHE_SALT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: request-control-secrets
+              key: cache-salt-secret
         securityContext:
           runAsNonRoot: true
           runAsUser: 10001

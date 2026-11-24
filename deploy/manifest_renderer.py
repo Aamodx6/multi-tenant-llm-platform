@@ -20,6 +20,8 @@ class DeployConfig(BaseModel):
     model_bucket_name: str = "llm-model-weights"
     prefetch_service_account: str = "weight-prefetcher"
     use_prefetched_weights: bool = False
+    cache_salt_secret_name: str = "request-control-secrets"
+    cache_salt_secret_key: str = "cache-salt-secret"
     cluster_name: str = "llm-prod-eks"
     spot_instance_families: list[str] = Field(default_factory=lambda: ["g6", "g5"])
 
@@ -312,6 +314,16 @@ def _karpenter_nodeclass(cfg: DeployConfig) -> dict[str, Any]:
             "amiSelectorTerms": [{"alias": "al2023@latest"}],
             "role": f"{cfg.cluster_name}-karpenter-node",
             "instanceStorePolicy": "RAID0",
+            "userData": (
+                "MIME-Version: 1.0\n"
+                'Content-Type: multipart/mixed; boundary="//"\n\n'
+                "--//\n"
+                "Content-Type: text/x-shellscript; charset=\"us-ascii\"\n\n"
+                "#!/bin/sh\n"
+                "if [ -d /mnt/k8s-disks/0 ] && [ ! -e /mnt/nvme ]; then "
+                "ln -sfn /mnt/k8s-disks/0 /mnt/nvme; fi\n"
+                "--//--\n"
+            ),
             "subnetSelectorTerms": [{"tags": {"karpenter.sh/discovery": cfg.cluster_name}}],
             "securityGroupSelectorTerms": [{"tags": {"karpenter.sh/discovery": cfg.cluster_name}}],
             "blockDeviceMappings": [
@@ -355,14 +367,22 @@ def _weight_prefetch_daemonset(
     sync_commands = " && ".join(
         (
             f"(mkdir -p /models/.locks /models/.staging && "
-            f"flock /models/.locks/$(basename {rel}).lock /bin/sh -c '"
+            f"lock_name=$(printf '%s' '{rel}' | tr '/' '_') && "
+            f'flock "/models/.locks/${{lock_name}}.lock" /bin/sh -c \''
             f"if [ ! -f /models/{rel}/.ready ]; then "
-            f'stage="/models/.staging/$(basename {rel}).$$"; '
+            f'stage="/models/.staging/${{lock_name}}.$$"; '
+            f'trap "rm -rf \\"$stage\\"" EXIT; '
             f'mkdir -p "$stage" && '
-            f's5cmd cp --concurrency 32 "{uri}/*" "$stage/" && '
+            f'/tools/s5cmd cp --concurrency 32 "{uri}/*" "$stage/" && '
+            f'(ls "$stage"/*.safetensors >/dev/null 2>&1 || '
+            f'ls "$stage"/adapter_model* >/dev/null 2>&1) && '
             f'touch "$stage/.ready" && '
             f'mkdir -p "$(dirname /models/{rel})" && '
-            f'mv "$stage" "/models/{rel}"; fi\')'
+            f'rm -rf "/models/{rel}.old" && '
+            f'([ ! -e "/models/{rel}" ] || mv "/models/{rel}" "/models/{rel}.old") && '
+            f'mv "$stage" "/models/{rel}" && '
+            f'rm -rf "/models/{rel}.old" && '
+            f"trap - EXIT; fi')"
         )
         for rel, uri in sync_entries
     )
@@ -389,19 +409,31 @@ def _weight_prefetch_daemonset(
                             "effect": "NoSchedule",
                         }
                     ],
+                    "initContainers": [
+                        {
+                            "name": "copy-s5cmd",
+                            "image": cfg.s5cmd_image,
+                            "command": ["cp", "/s5cmd", "/tools/s5cmd"],
+                            "volumeMounts": [{"name": "tools", "mountPath": "/tools"}],
+                        }
+                    ],
                     "containers": [
                         {
                             "name": "s5cmd-prefetch",
-                            "image": cfg.s5cmd_image,
+                            "image": "alpine:3.20",
                             "command": ["/bin/sh", "-c", script],
-                            "volumeMounts": [{"name": "model-cache", "mountPath": "/models"}],
+                            "volumeMounts": [
+                                {"name": "model-cache", "mountPath": "/models"},
+                                {"name": "tools", "mountPath": "/tools"},
+                            ],
                         }
                     ],
                     "volumes": [
                         {
                             "name": "model-cache",
                             "hostPath": {"path": "/mnt/nvme/models", "type": "DirectoryOrCreate"},
-                        }
+                        },
+                        {"name": "tools", "emptyDir": {}},
                     ],
                 },
             },
@@ -454,6 +486,17 @@ def _request_control_rollout(cfg: DeployConfig) -> dict[str, Any]:
                             "name": "request-control",
                             "image": cfg.request_control_image,
                             "ports": [{"containerPort": 8080}],
+                            "env": [
+                                {
+                                    "name": "CACHE_SALT_SECRET",
+                                    "valueFrom": {
+                                        "secretKeyRef": {
+                                            "name": cfg.cache_salt_secret_name,
+                                            "key": cfg.cache_salt_secret_key,
+                                        }
+                                    },
+                                }
+                            ],
                             "securityContext": {
                                 "runAsNonRoot": True,
                                 "runAsUser": 10001,

@@ -234,6 +234,7 @@ def load_and_validate(catalog_yaml: str) -> ModelPoolCatalog:
     pools: dict[str, ModelPoolSpec] = {}
     aliases: dict[str, str] = {}
     loras: dict[str, tuple[str, LoraAdapterSpec]] = {}
+    all_pool_names = set(raw["pools"].keys())
     for pool_name, pool_data in raw["pools"].items():
         if not isinstance(pool_data, dict):
             raise CatalogValidationError(f"Pool '{pool_name}' must be a mapping.")
@@ -243,14 +244,14 @@ def load_and_validate(catalog_yaml: str) -> ModelPoolCatalog:
             raise CatalogValidationError(f"Invalid pool '{pool_name}': {exc}") from exc
         pools[pool_name] = spec
         for alias in spec.aliases:
-            if alias in aliases or alias in loras:
-                existing = aliases.get(alias) or loras[alias][0]
+            if alias in all_pool_names or alias in aliases or alias in loras:
+                existing = aliases.get(alias) or (loras[alias][0] if alias in loras else alias)
                 raise CatalogValidationError(
                     f"Duplicate alias '{alias}' mapped to '{existing}' and '{pool_name}'."
                 )
             aliases[alias] = pool_name
         for lora in spec.loras:
-            if lora.name in loras or lora.name in aliases or lora.name in pools:
+            if lora.name in loras or lora.name in aliases or lora.name in all_pool_names:
                 raise CatalogValidationError(
                     f"Duplicate LoRA adapter name '{lora.name}' in pool '{pool_name}'."
                 )
