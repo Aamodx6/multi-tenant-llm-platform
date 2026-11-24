@@ -4,12 +4,14 @@ version = "0.1.0"
 description = "Multi-Tenant LLM Serving Platform deepened core modules"
 requires-python = ">=3.12"
 dependencies = [
+  "anyio>=4.0",
+  "httpx>=0.27",
   "pydantic>=2.0",
   "pyyaml>=6.0",
+  "redis>=5.0",
+  "scikit-learn>=1.5",
   "starlette>=1.0",
   "uvicorn>=0.30",
-  "redis>=5.0",
-  "httpx>=0.27",
 ]
 
 [tool.pytest.ini_options]

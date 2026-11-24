@@ -553,20 +553,32 @@ async def test_queued_disconnect_refunds_budget_and_chwbl_minimizes_reshuffle() 
             )
             before_map[f"sys-prompt-{i}"] = r.headers["x-served-replica"]
 
-        replicas.append(ReplicaEndpoint(replica_id="8b-3", url="http://8b-3:8000"))
-        engine_ring.set_replicas("pool-8b", replicas)
+        expanded_replicas = [*replicas, ReplicaEndpoint(replica_id="8b-3", url="http://8b-3:8000")]
+        app_ring_expanded = create_app(
+            catalog=catalog,
+            budget=TenantBudget(
+                adapter=InMemoryBudgetAdapter(
+                    {hash_api_key("sk-b"): TenantRecord("b", PriorityClass.PAID, 100_000)}
+                )
+            ),
+            pool_health=PoolHealthStore(),
+            engine=FakeEngineAdapter(replicas={"pool-8b": expanded_replicas}),
+        )
         moved = 0
-        for i in range(20):
-            r = await client.post(
-                "/v1/chat/completions",
-                headers={"Authorization": "Bearer sk-b"},
-                json={
-                    "model": "qwen-7b",
-                    "messages": [{"role": "system", "content": f"sys-prompt-{i}"}],
-                },
-            )
-            if r.headers["x-served-replica"] != before_map[f"sys-prompt-{i}"]:
-                moved += 1
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app_ring_expanded), base_url="http://test"
+        ) as client_expanded:
+            for i in range(20):
+                r = await client_expanded.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sk-b"},
+                    json={
+                        "model": "qwen-7b",
+                        "messages": [{"role": "system", "content": f"sys-prompt-{i}"}],
+                    },
+                )
+                if r.headers["x-served-replica"] != before_map[f"sys-prompt-{i}"]:
+                    moved += 1
         assert moved <= 9
 
 
@@ -578,8 +590,10 @@ async def test_vllm_adapter_parses_sse_usage_aborts_by_closing_stream_and_scrape
 
     class _MockSSEStream(httpx.AsyncByteStream):
         async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n'
             yield b'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n'
             yield b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
             yield (
                 b'data: {"choices":[],"usage":{"prompt_tokens":4,'
                 b'"completion_tokens":2,"total_tokens":6}}\n\n'
@@ -638,3 +652,36 @@ async def test_vllm_adapter_parses_sse_usage_aborts_by_closing_stream_and_scrape
     await adapter.abort(replica=rep, request_id="req-1")
     assert all("/v1/abort" not in u for u in seen_urls)
     assert stream_closed is True
+
+    # End-to-end through RequestControl: preserves role="assistant" & terminal finish_reason="stop"
+    catalog = load_and_validate(CATALOG_YAML)
+    tenant = TenantRecord(tenant_id="acme", priority=PriorityClass.PAID, tpm_limit=1000)
+    app = create_app(
+        catalog=catalog,
+        budget=TenantBudget(adapter=InMemoryBudgetAdapter({hash_api_key("sk-acme"): tenant})),
+        pool_health=PoolHealthStore(),
+        engine=adapter,
+    )
+    gw_chunks: list[dict[str, Any]] = []
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client,
+        client.stream(
+            "POST",
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme"},
+            json={
+                "model": "qwen-7b",
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        ) as resp,
+    ):
+        async for line in resp.aiter_lines():
+            if line.startswith("data: ") and line != "data: [DONE]":
+                gw_chunks.append(json.loads(line[6:]))
+    assert gw_chunks[0]["choices"][0]["delta"]["role"] == "assistant"
+    assert gw_chunks[-2]["choices"][0]["finish_reason"] == "stop"
+    assert gw_chunks[-1]["usage"]["total_tokens"] == 6

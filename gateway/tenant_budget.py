@@ -64,6 +64,13 @@ def _retry_after_seconds(requested: int, available: float, tpm_limit: int) -> in
     return max(1, int(deficit / rate_per_sec) + 1)
 
 
+def _concurrency_exceeded_error(tenant: TenantRecord) -> BudgetExceededError:
+    return BudgetExceededError(
+        f"Tenant '{tenant.tenant_id}' exceeded concurrency cap ({tenant.max_concurrency}).",
+        retry_after_seconds=1,
+    )
+
+
 class BudgetAdapter(Protocol):
     """Storage seam encapsulating key lookup, token-bucket state, and usage reconciliation."""
 
@@ -103,10 +110,7 @@ class InMemoryBudgetAdapter:
     def reserve(self, tenant: TenantRecord, model: str, est_tokens: int) -> Permit:
         active = self._active_permits.setdefault(tenant.tenant_id, set())
         if len(active) >= tenant.max_concurrency:
-            raise BudgetExceededError(
-                f"Tenant '{tenant.tenant_id}' exceeded concurrency cap ({tenant.max_concurrency}).",
-                retry_after_seconds=1,
-            )
+            raise _concurrency_exceeded_error(tenant)
         now = self._now()
         self._caps[tenant.tenant_id] = tenant.tpm_limit
         bucket = self._refill(tenant, now)
@@ -159,7 +163,7 @@ local now_override = ARGV[2]
 local req = tonumber(ARGV[3])
 local max_conc = tonumber(ARGV[4])
 local permit_id = ARGV[5]
-local lease_ttl = tonumber(ARGV[6])
+local permit_ttl = tonumber(ARGV[6])
 
 local now
 if now_override ~= '' then
@@ -196,8 +200,8 @@ end
 tokens = tokens - req
 redis.call('HSET', bucket_key, 'tokens', tokens, 'ts', ts)
 redis.call('EXPIRE', bucket_key, 120)
-redis.call('ZADD', conc_key, now + lease_ttl, permit_id)
-redis.call('EXPIRE', conc_key, math.ceil(lease_ttl) + 30)
+redis.call('ZADD', conc_key, now + permit_ttl, permit_id)
+redis.call('EXPIRE', conc_key, math.ceil(permit_ttl) + 30)
 return {1, tostring(tokens)}
 """
 
@@ -233,7 +237,7 @@ class RedisPostgresAdapter:
         degraded_tpm_ratio: float = 0.25,
         gateway_replicas: int = 1,
         key_cache_ttl_seconds: int = 300,
-        concurrency_lease_seconds: float = 120.0,
+        permit_ttl_seconds: float = 120.0,
         now_fn: Callable[[], float] | None = None,
     ) -> None:
         self._redis = redis_client
@@ -241,7 +245,7 @@ class RedisPostgresAdapter:
         self._degraded_ratio = degraded_tpm_ratio
         self._gateway_replicas = max(1, gateway_replicas)
         self._key_cache_ttl = key_cache_ttl_seconds
-        self._lease_ttl = concurrency_lease_seconds
+        self._permit_ttl = permit_ttl_seconds
         self._now = now_fn
         self._local_fallback = InMemoryBudgetAdapter(
             {},
@@ -297,15 +301,11 @@ class RedisPostgresAdapter:
                 str(est_tokens),
                 str(tenant.max_concurrency),
                 permit_id,
-                f"{self._lease_ttl:.1f}",
+                f"{self._permit_ttl:.1f}",
             )
             code = int(res[0])
             if code == -1:
-                raise BudgetExceededError(
-                    f"Tenant '{tenant.tenant_id}' exceeded concurrency cap "
-                    f"({tenant.max_concurrency}).",
-                    retry_after_seconds=1,
-                )
+                raise _concurrency_exceeded_error(tenant)
             if code == 0:
                 remaining = float(res[1])
                 retry = _retry_after_seconds(est_tokens, remaining, tenant.tpm_limit)

@@ -86,6 +86,8 @@ class StreamChunk:
     completion_tokens_so_far: int = 0
     prompt_tokens: int | None = None
     finished: bool = False
+    role: str | None = None
+    is_usage_only: bool = False
 
 
 class InferenceEngine(Protocol):
@@ -206,9 +208,6 @@ class FakeEngineAdapter:
     def list_replicas(self, pool: str) -> list[ReplicaEndpoint]:
         return list(self._replicas.get(pool, []))
 
-    def set_replicas(self, pool: str, replicas: list[ReplicaEndpoint]) -> None:
-        self._replicas[pool] = list(replicas)
-
     async def complete(
         self,
         *,
@@ -272,9 +271,6 @@ class VLLMAdapter:
 
     def list_replicas(self, pool: str) -> list[ReplicaEndpoint]:
         return list(self._replicas.get(pool, []))
-
-    def set_replicas(self, pool: str, replicas: list[ReplicaEndpoint]) -> None:
-        self._replicas[pool] = list(replicas)
 
     async def scrape_metrics(self) -> None:
         """Poll vLLM /metrics on all replicas to refresh queue and KV-cache load."""
@@ -356,33 +352,25 @@ class VLLMAdapter:
                     choices = event.get("choices") or []
                     if not choices:
                         if isinstance(usage, dict):
-                            yield StreamChunk(
+                            yield _make_stream_chunk(
                                 delta="",
-                                completion_tokens_so_far=int(
-                                    usage.get("completion_tokens", completion_count)
-                                ),
-                                prompt_tokens=int(usage["prompt_tokens"])
-                                if "prompt_tokens" in usage
-                                else None,
+                                fallback_count=completion_count,
+                                usage=usage,
                                 finished=True,
+                                is_usage_only=True,
                             )
                         continue
                     choice = choices[0]
-                    delta_text = str(choice.get("delta", {}).get("content") or "")
+                    delta_obj = choice.get("delta") or {}
+                    delta_text = str(delta_obj.get("content") or "")
                     if delta_text:
                         completion_count += 1
-                    finished = choice.get("finish_reason") is not None
-                    yield StreamChunk(
+                    yield _make_stream_chunk(
                         delta=delta_text,
-                        completion_tokens_so_far=int(
-                            usage.get("completion_tokens", completion_count)
-                            if isinstance(usage, dict)
-                            else completion_count
-                        ),
-                        prompt_tokens=int(usage["prompt_tokens"])
-                        if isinstance(usage, dict) and "prompt_tokens" in usage
-                        else None,
-                        finished=finished,
+                        fallback_count=completion_count,
+                        usage=usage if isinstance(usage, dict) else None,
+                        finished=choice.get("finish_reason") is not None,
+                        role=delta_obj.get("role"),
                     )
             finally:
                 self._active_streams.pop(request_id, None)
@@ -393,6 +381,27 @@ class VLLMAdapter:
         resp = self._active_streams.pop(request_id, None)
         if resp is not None:
             await resp.aclose()
+
+
+def _make_stream_chunk(
+    *,
+    delta: str,
+    fallback_count: int,
+    usage: dict[str, Any] | None,
+    finished: bool,
+    role: str | None = None,
+    is_usage_only: bool = False,
+) -> StreamChunk:
+    comp = int(usage.get("completion_tokens", fallback_count)) if usage else fallback_count
+    prompt = int(usage["prompt_tokens"]) if usage and "prompt_tokens" in usage else None
+    return StreamChunk(
+        delta=delta,
+        completion_tokens_so_far=comp,
+        prompt_tokens=prompt,
+        finished=finished,
+        role=role,
+        is_usage_only=is_usage_only,
+    )
 
 
 def _estimate_prompt_tokens(messages: list[dict[str, Any]] | list[ChatMessage]) -> int:
@@ -667,10 +676,13 @@ def _streaming_chat_response(
                 emitted_tokens = chunk.completion_tokens_so_far
                 if chunk.prompt_tokens is not None:
                     actual_prompt_tokens = chunk.prompt_tokens
-                if not chunk.delta and not chunk.finished:
+                if chunk.is_usage_only:
                     continue
-                if not chunk.delta and chunk.finished:
-                    continue
+                delta_obj: dict[str, Any] = {}
+                if chunk.role is not None:
+                    delta_obj["role"] = chunk.role
+                if chunk.delta or chunk.role is not None:
+                    delta_obj["content"] = chunk.delta
                 payload = {
                     "id": f"chatcmpl-{trace_id}",
                     "object": "chat.completion.chunk",
@@ -679,7 +691,7 @@ def _streaming_chat_response(
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"content": chunk.delta},
+                            "delta": delta_obj,
                             "finish_reason": "stop" if chunk.finished else None,
                         }
                     ],
@@ -709,17 +721,19 @@ def _streaming_chat_response(
             try:
                 if not completed:
                     with anyio.CancelScope(shield=True):
+                        aclose = getattr(stream_iter, "aclose", None)
+                        if aclose is not None:
+                            await aclose()
                         await deps.engine.abort(replica=replica, request_id=trace_id)
             finally:
                 prompt_used = (
                     actual_prompt_tokens if actual_prompt_tokens is not None else est_prompt
                 )
-                total_tokens = prompt_used + emitted_tokens
                 _record_usage_and_reconcile(
                     deps=deps,
                     permit=permit,
                     pool_name=target_pool.name,
-                    total_tokens=total_tokens,
+                    total_tokens=prompt_used + emitted_tokens,
                     trace_id=trace_id,
                 )
                 deps.admission.release()

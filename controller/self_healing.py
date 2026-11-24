@@ -49,6 +49,18 @@ class K8sNodeClient(Protocol):
 
 
 @dataclass(frozen=True)
+class TelemetryFeature:
+    """Multivariate feature vector used for Isolation Forest baseline fitting."""
+
+    ttft_ms: float
+    kv_cache_usage: float
+    gpu_temp_c: float
+
+    def to_row(self) -> list[float]:
+        return [self.ttft_ms, self.kv_cache_usage, self.gpu_temp_c]
+
+
+@dataclass(frozen=True)
 class PodTelemetry:
     """Single-pod GPU and inference telemetry sample."""
 
@@ -195,7 +207,7 @@ class K8sActuatorAdapter:
         self._client.page_human(target, reason)
 
 
-def compute_z_score(series: list[float], *, min_delta_ms: float = 25.0) -> float:
+def compute_z_score(series: list[float], *, min_delta: float = 25.0) -> float:
     """Compute Iglewicz-Hoaglin MAD Modified Z-Score for the latest telemetry point."""
     if len(series) < 3:
         return 0.0
@@ -205,8 +217,8 @@ def compute_z_score(series: list[float], *, min_delta_ms: float = 25.0) -> float
     mad = statistics.median(deviations)
     latest_diff = abs(series[-1] - med)
     if mad < 1e-6:
-        return 0.0 if latest_diff < min_delta_ms else 10.0
-    if latest_diff < min_delta_ms:
+        return 0.0 if latest_diff < min_delta else 10.0
+    if latest_diff < min_delta:
         return 0.0
     return 0.6745 * (series[-1] - med) / mad
 
@@ -223,7 +235,7 @@ class SelfHealingEngine:
         thermal_threshold_c: float = 85.0,
         kv_cache_threshold: float = 0.95,
         z_score_threshold: float = 3.5,
-        baseline_features: Sequence[tuple[float, float, float]] | None = None,
+        baseline_features: Sequence[TelemetryFeature] | None = None,
     ) -> None:
         self._actuator = actuator
         self._pool_health = pool_health
@@ -234,7 +246,7 @@ class SelfHealingEngine:
         self._iso_forest: IsolationForest | None = None
         if baseline_features and len(baseline_features) >= 5:
             model = IsolationForest(contamination=0.05, random_state=42)
-            model.fit(list(baseline_features))
+            model.fit([f.to_row() for f in baseline_features])
             self._iso_forest = model
 
     def complete_drain(self, guardrails: GuardrailState, node: str) -> None:
@@ -244,8 +256,12 @@ class SelfHealingEngine:
     def _is_multivariate_anomaly(self, pod: PodTelemetry) -> bool:
         if self._iso_forest is None or not pod.ttft_ms_series:
             return False
-        point = [[pod.ttft_ms_series[-1], pod.kv_cache_usage, pod.gpu_temp_c]]
-        return int(self._iso_forest.predict(point)[0]) == -1
+        feature = TelemetryFeature(
+            ttft_ms=pod.ttft_ms_series[-1],
+            kv_cache_usage=pod.kv_cache_usage,
+            gpu_temp_c=pod.gpu_temp_c,
+        )
+        return int(self._iso_forest.predict([feature.to_row()])[0]) == -1
 
     def reconcile(
         self,

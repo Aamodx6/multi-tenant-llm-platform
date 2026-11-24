@@ -10,6 +10,7 @@ from controller.self_healing import (
     PodTelemetry,
     SelfHealingEngine,
     SimulatedActuatorAdapter,
+    TelemetryFeature,
     TelemetryWindow,
     compute_z_score,
 )
@@ -179,16 +180,16 @@ def test_multivariate_isolation_forest_flags_joint_degradation() -> None:
     pool_health = PoolHealthStore()
     actuator = SimulatedActuatorAdapter()
     baseline = [
-        (100.0, 0.30, 62.0),
-        (105.0, 0.35, 63.0),
-        (98.0, 0.28, 61.0),
-        (102.0, 0.32, 62.5),
-        (104.0, 0.31, 63.0),
-        (101.0, 0.33, 62.0),
-        (99.0, 0.29, 61.5),
-        (103.0, 0.34, 62.8),
-        (100.0, 0.30, 62.2),
-        (102.0, 0.31, 62.4),
+        TelemetryFeature(100.0, 0.30, 62.0),
+        TelemetryFeature(105.0, 0.35, 63.0),
+        TelemetryFeature(98.0, 0.28, 61.0),
+        TelemetryFeature(102.0, 0.32, 62.5),
+        TelemetryFeature(104.0, 0.31, 63.0),
+        TelemetryFeature(101.0, 0.33, 62.0),
+        TelemetryFeature(99.0, 0.29, 61.5),
+        TelemetryFeature(103.0, 0.34, 62.8),
+        TelemetryFeature(100.0, 0.30, 62.2),
+        TelemetryFeature(102.0, 0.31, 62.4),
     ]
     engine = SelfHealingEngine(
         actuator=actuator,
