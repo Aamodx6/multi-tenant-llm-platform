@@ -10,15 +10,15 @@ A Kubernetes-based platform that serves open LLMs to multiple tenants with GPU-a
 
 | Layer | Components | Purpose |
 | --- | --- | --- |
-| Clients | Tenant apps using an OpenAI-style API with SSE streaming | Entry point |
-| Request path | Gateway, admission control, router | Auth, token limits, priority, routing |
+| Callers | Tenant apps using an OpenAI-style HTTP interface with SSE streaming | Entry point |
+| Request path | Unified Request Control (`gateway`: auth, `TenantBudget`, local admission, prefix router) | Auth, token limits, priority, routing |
 | Inference plane | vLLM pool A (8B, AWQ or FP8), vLLM pool B (70B, tensor parallel), fallback pool (small model, spot GPU) | GPU compute on Kubernetes node pools |
-| State and storage | Model store (S3 or MinIO), node cache (NVMe weights), Redis, Postgres | Weights, limits, router state, tenants, usage |
+| State and storage | `ModelPoolCatalog` (single source of truth), Model store (S3 or MinIO), node cache (NVMe weights), Redis (`TenantBudget` + `PoolHealth`), Postgres | Pool config, weights, limits, tenants, usage |
 | Observability | Prometheus and DCGM, Loki and traces, Grafana and burn-rate alerts | Metrics, logs, traces, SLOs |
-| Control loops (AIOps) | KEDA and Karpenter, anomaly detector, remediation loop | Scaling and self-healing |
+| Control loops (AIOps) | KEDA and Karpenter, unified `SelfHealingEngine` (`TelemetryWindow` scoring + `RemediationPlan` via `ClusterActuator`) | Scaling and self-healing |
 | Delivery (GitOps) | CI and bench gate, ArgoCD and Rollouts, Terraform and model registry | Safe, repeatable releases |
 
-Data flow: clients, gateway, admission control, router, inference pools. Telemetry flows from the inference plane into observability, then into the control loops, whose actions return to the cluster. Delivery deploys into the cluster.
+Data flow: callers, `RequestControl`, inference pools. `ModelPoolCatalog` drives pool configuration across routing, KEDA, and rollouts. Telemetry flows from the inference plane into observability and `SelfHealingEngine`, which coordinates slow-path actions via `ClusterActuator` and `PoolHealth` overrides. Delivery deploys into the cluster.
 
 ## Request lifecycle
 
@@ -33,13 +33,15 @@ Data flow: clients, gateway, admission control, router, inference pools. Telemet
 
 | Component | Implementation | Key design points |
 | --- | --- | --- |
-| Gateway | FastAPI or Envoy with ext-authz | Stateless, HPA on CPU and RPS, per-tenant metrics labels |
-| Admission | In-process queues backed by Redis | Priority classes, load shedding, per-tenant concurrency caps |
-| Router | Gateway module | Prefix hashing, bounded load, health from engine metrics, fallback chain |
-| Inference pool | One Deployment per model and quantization | 1 GPU per pod (or 2 to 4 for tensor parallel, same node), `/dev/shm` sized, startup probe covers model load, readiness after a warmup request |
+| Request Control | Single Python (`Starlette` / `FastAPI` + `Pydantic`) module | Combines auth, `TenantBudget`, local priority admission, prefix-aware routing, and SSE streaming behind an `InferenceEngine` seam (`vLLMAdapter` / `FakeEngineAdapter`) |
+| Admission | In-process priority queues per replica | Local priority classes, wait-budget load shedding (`429 Retry-After`), no Redis dependency on queue state |
+| Tenant Budget | `TenantBudget` module (`RedisPostgresAdapter` / `InMemoryBudgetAdapter`) | Hashed API key lookup, atomic Redis token-bucket reserve/reconcile, conservative local fallback encapsulated on Redis outage |
+| Pool Health | `PoolHealth` seam (`healthy`, `degraded`, `unhealthy`) | Fast-path routing reads state; slow-path remediation sets TTL-bounded `degraded` overrides without fighting ArgoCD |
+| Model Pool Catalog | `ModelPoolCatalog` schema and renderer | Single validated source of truth for pool aliases, fallback chains, isolation mode (`shared` vs `dedicated`), KEDA bounds, and SLO targets |
+| Inference pool | One Deployment per model pool and quantization | 1 GPU per pod (or 2 to 4 for tensor parallel, same node), `/dev/shm` sized, startup probe covers model load, readiness after a warmup request |
 | Weight delivery | S3 or MinIO, DaemonSet prefetch to node NVMe | Cuts cold start from minutes to seconds on warm nodes |
 | Node pools | Small GPU (L4 or A10G), large GPU (A100 or H100), CPU | Taints on GPU pools, nodeSelectors per pool |
-| Redis | Single primary with replica | Token buckets, API key cache, router state; losing it must degrade to conservative limits, not an outage |
+| Redis | Single primary with replica | Encapsulated inside `TenantBudget` and `PoolHealth`; losing it degrades cleanly to conservative local limits |
 | Postgres | Managed or CloudNativePG | Tenants, keys, quotas, model aliases, usage rollups |
 
 ## Autoscaling
@@ -47,7 +49,7 @@ Data flow: clients, gateway, admission control, router, inference pools. Telemet
 - **Pod level (KEDA with Prometheus triggers):** scale on `vllm:num_requests_waiting` per replica and KV-cache usage above about 80%. GPU utilization is a secondary signal only, since it saturates early on LLM workloads.
 - **Node level (Karpenter or Cluster Autoscaler):** spot plus on-demand mix, with low-priority pause pods as headroom so new nodes are not on the critical path.
 - **Scale-down:** long cooldown, `preStop` drain, and a `terminationGracePeriodSeconds` longer than the longest allowed generation.
-- **Minimums:** at least one replica for primary pools. Scale-to-zero only for the fallback pool or idle tenants.
+- **Minimums:** at least one replica for primary shared pools. Scale-to-zero only for the fallback pool or `dedicated` isolation pools declared in `ModelPoolCatalog`.
 
 ## Observability
 
@@ -59,14 +61,14 @@ Data flow: clients, gateway, admission control, router, inference pools. Telemet
 
 ## AIOps control loops
 
-The anomaly detector reads DCGM and engine time series, computes per-GPU rolling features, and exposes an anomaly score as a Prometheus metric. Alerts feed the remediation loop, a small operator driven by a `RemediationPolicy` CRD.
+`SelfHealingEngine` co-locates rolling `TelemetryWindow` anomaly scoring (z-score and threshold baseline) with `RemediationPolicy` guardrail evaluation, emitting a deterministic `RemediationPlan` across a `ClusterActuator` seam (`K8sActuatorAdapter` in prod, `SimulatedActuatorAdapter` in tests). Anomaly scores are still exported as Prometheus metrics for Grafana without adding a Prometheus/Alertmanager hop to the critical remediation path.
 
 | Signal | Action |
 | --- | --- |
 | XID or ECC errors, thermal throttling | Cordon and drain the node, reschedule pods |
-| KV cache above about 95%, OOM restarts | Lower `max-num-seqs`, then restart the pod |
-| Queue depth and p95 TTFT rising | Scale out, shed lowest priority class |
-| Pool failing health checks | Router shifts traffic to fallback pool |
+| KV cache above about 95%, OOM restarts | Mark pool `degraded` via `PoolHealth` (shifting new/excess traffic without mutating ArgoCD-managed Deployment args), then restart the unhealthy pod |
+| Queue depth and p95 TTFT rising | `RequestControl` sheds lowest priority class on the fast path; KEDA scales out on the slow path |
+| Pool failing health checks | `RequestControl` shifts traffic to fallback pool (`PoolHealth` hysteresis prevents flapping) |
 | Canary breaches SLO | Argo Rollouts automatic rollback |
 
 **Guardrails:** dry-run mode, at most one node drained at a time, rate limits per action, an audit log, and escalation to a human page when an action fails twice.
@@ -79,17 +81,19 @@ The anomaly detector reads DCGM and engine time series, computes per-GPU rolling
 
 ## Security and isolation
 
-- NetworkPolicies: only the router can reach inference pods, and inference pods have no general egress.
+- NetworkPolicies: only `RequestControl`, Prometheus scrapes, and kubelet probes can reach inference pods, and inference pods have no general egress beyond telemetry export and model store cache fallback.
 - Hashed API keys, secrets via External Secrets, non-root signed images.
 - Per-tenant concurrency and token caps prevent noisy neighbors. Separate pools for tenants that need hard isolation.
 
 ## Key decisions (ADRs)
 
-1. vLLM as the primary engine, with SGLang or TensorRT-LLM kept behind the same pool interface for benchmarking.
-2. Custom gateway instead of LiteLLM, because token-aware limits and prefix routing are the point of the project.
-3. KEDA on queue depth instead of CPU or GPU utilization.
-4. Prefix-hash routing with bounded load instead of plain round-robin.
-5. Remediation as a policy-driven operator with guardrails, not ad hoc scripts.
+Full records live in `docs/adr/` and domain terms in [GLOSSARY.md](../GLOSSARY.md):
+
+1. [0001: Collapse Gateway, Admission, and Router into Request Control](./adr/0001-request-control-single-module.md)
+2. [0002: Separate Fast-Path Routing from Slow-Path Remediation via Pool Health](./adr/0002-pool-health-ownership.md)
+3. [0003: Encapsulate Redis Outage Degradation in Tenant Budget and Keep Queues Local](./adr/0003-tenant-budget-and-local-queues.md)
+4. [0004: Co-Locate Anomaly Scoring and Remediation Policy Behind Cluster Actuator](./adr/0004-self-healing-actuator-seam.md)
+5. [0005: Centralize Model Pool Configuration in Model Pool Catalog](./adr/0005-model-pool-catalog.md)
 
 ### ADR template
 

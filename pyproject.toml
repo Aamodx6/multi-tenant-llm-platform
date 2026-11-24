@@ -1,0 +1,34 @@
+[project]
+name = "multi-tenant-llm-platform"
+version = "0.1.0"
+description = "Multi-Tenant LLM Serving Platform deepened core modules"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.0",
+  "pyyaml>=6.0",
+  "starlette>=1.0",
+  "uvicorn>=0.30",
+  "redis>=5.0",
+  "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+warn_unused_configs = true
+files = ["catalog", "gateway", "controller", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["yaml", "yaml.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
