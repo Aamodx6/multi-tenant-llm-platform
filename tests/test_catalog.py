@@ -50,6 +50,10 @@ def test_load_and_validate_renders_gateway_keda_and_rollouts_targets() -> None:
     assert targets["rollout_slos"]["pool-fallback"]["availability"] == 0.99
     assert targets["prefetch_targets"]["pool-8b"]["prefetch_uri"] == "s3://models/Qwen/Qwen2.5-7B-Instruct"
     assert targets["prefetch_targets"]["pool-8b"]["warmup_prompt"] == "Hello"
+    assert "--quantization" in targets["vllm_args"]["pool-8b"]
+    assert "awq" in targets["vllm_args"]["pool-8b"]
+    assert "--enable-prefix-caching" in targets["vllm_args"]["pool-8b"]
+    assert "--quantization" not in targets["vllm_args"]["pool-fallback"]
 
 
 def test_rejects_unknown_fallback_pool() -> None:

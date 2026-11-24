@@ -83,7 +83,7 @@ class _Bucket:
 
 
 class InMemoryBudgetAdapter:
-    """In-process token-bucket adapter for deterministic RequestControl tests."""
+    """In-process token-bucket and concurrency adapter for deterministic RequestControl tests."""
 
     def __init__(
         self,
@@ -95,11 +95,18 @@ class InMemoryBudgetAdapter:
         self._now = now_fn
         self._buckets: dict[str, _Bucket] = {}
         self._caps: dict[str, int] = {}
+        self._active_permits: dict[str, set[str]] = {}
 
     def lookup_tenant(self, key_hash: str) -> TenantRecord | None:
         return self._keys.get(key_hash)
 
     def reserve(self, tenant: TenantRecord, model: str, est_tokens: int) -> Permit:
+        active = self._active_permits.setdefault(tenant.tenant_id, set())
+        if len(active) >= tenant.max_concurrency:
+            raise BudgetExceededError(
+                f"Tenant '{tenant.tenant_id}' exceeded concurrency cap ({tenant.max_concurrency}).",
+                retry_after_seconds=1,
+            )
         now = self._now()
         self._caps[tenant.tenant_id] = tenant.tpm_limit
         bucket = self._refill(tenant, now)
@@ -110,8 +117,10 @@ class InMemoryBudgetAdapter:
                 retry_after_seconds=retry,
             )
         bucket.tokens -= est_tokens
+        permit_id = uuid.uuid4().hex
+        active.add(permit_id)
         return Permit(
-            permit_id=uuid.uuid4().hex,
+            permit_id=permit_id,
             tenant_id=tenant.tenant_id,
             priority=tenant.priority,
             model=model,
@@ -119,6 +128,9 @@ class InMemoryBudgetAdapter:
         )
 
     def reconcile(self, permit: Permit, actual_tokens: int) -> None:
+        active = self._active_permits.get(permit.tenant_id)
+        if active is not None:
+            active.discard(permit.permit_id)
         delta = permit.reserved_tokens - actual_tokens
         bucket = self._buckets.get(permit.tenant_id)
         if bucket is None or delta == 0:
@@ -140,13 +152,30 @@ class InMemoryBudgetAdapter:
 
 
 _RESERVE_LUA = """
-local key = KEYS[1]
+local bucket_key = KEYS[1]
+local conc_key = KEYS[2]
 local cap = tonumber(ARGV[1])
-local rate = cap / 60.0
-local now = tonumber(ARGV[2])
+local now_override = ARGV[2]
 local req = tonumber(ARGV[3])
+local max_conc = tonumber(ARGV[4])
+local permit_id = ARGV[5]
+local lease_ttl = tonumber(ARGV[6])
 
-local vals = redis.call('HMGET', key, 'tokens', 'ts')
+local now
+if now_override ~= '' then
+  now = tonumber(now_override)
+else
+  local t = redis.call('TIME')
+  now = tonumber(t[1]) + tonumber(t[2]) / 1000000.0
+end
+
+redis.call('ZREMRANGEBYSCORE', conc_key, '-inf', now)
+if redis.call('ZCARD', conc_key) >= max_conc then
+  return {-1, tostring(max_conc)}
+end
+
+local rate = cap / 60.0
+local vals = redis.call('HMGET', bucket_key, 'tokens', 'ts')
 local tokens = tonumber(vals[1])
 local ts = tonumber(vals[2])
 if tokens == nil then
@@ -159,26 +188,36 @@ else
 end
 
 if tokens < req then
-  redis.call('HMSET', key, 'tokens', tokens, 'ts', ts)
+  redis.call('HSET', bucket_key, 'tokens', tokens, 'ts', ts)
+  redis.call('EXPIRE', bucket_key, 120)
   return {0, tostring(tokens)}
 end
 
 tokens = tokens - req
-redis.call('HMSET', key, 'tokens', tokens, 'ts', ts)
-redis.call('EXPIRE', key, 120)
+redis.call('HSET', bucket_key, 'tokens', tokens, 'ts', ts)
+redis.call('EXPIRE', bucket_key, 120)
+redis.call('ZADD', conc_key, now + lease_ttl, permit_id)
+redis.call('EXPIRE', conc_key, math.ceil(lease_ttl) + 30)
 return {1, tostring(tokens)}
 """
 
 _RECONCILE_LUA = """
-local key = KEYS[1]
+local bucket_key = KEYS[1]
+local conc_key = KEYS[2]
 local delta = tonumber(ARGV[1])
 local cap = tonumber(ARGV[2])
-local tokens = tonumber(redis.call('HGET', key, 'tokens'))
+local permit_id = ARGV[3]
+
+redis.call('ZREM', conc_key, permit_id)
+if delta == 0 then
+  return 1
+end
+local tokens = tonumber(redis.call('HGET', bucket_key, 'tokens'))
 if tokens == nil then
   return 0
 end
 tokens = math.min(cap, math.max(0.0, tokens + delta))
-redis.call('HSET', key, 'tokens', tokens)
+redis.call('HSET', bucket_key, 'tokens', tokens)
 return 1
 """
 
@@ -192,15 +231,22 @@ class RedisPostgresAdapter:
         redis_client: redis.Redis,
         pg_lookup: Callable[[str], TenantRecord | None],
         degraded_tpm_ratio: float = 0.25,
+        gateway_replicas: int = 1,
         key_cache_ttl_seconds: int = 300,
-        now_fn: Callable[[], float] = time.time,
+        concurrency_lease_seconds: float = 120.0,
+        now_fn: Callable[[], float] | None = None,
     ) -> None:
         self._redis = redis_client
         self._pg_lookup = pg_lookup
         self._degraded_ratio = degraded_tpm_ratio
+        self._gateway_replicas = max(1, gateway_replicas)
         self._key_cache_ttl = key_cache_ttl_seconds
+        self._lease_ttl = concurrency_lease_seconds
         self._now = now_fn
-        self._local_fallback = InMemoryBudgetAdapter({}, now_fn=now_fn)
+        self._local_fallback = InMemoryBudgetAdapter(
+            {},
+            now_fn=now_fn or time.monotonic,
+        )
         self._tenant_caps: dict[str, int] = {}
 
     def lookup_tenant(self, key_hash: str) -> TenantRecord | None:
@@ -238,27 +284,37 @@ class RedisPostgresAdapter:
 
     def reserve(self, tenant: TenantRecord, model: str, est_tokens: int) -> Permit:
         self._tenant_caps[tenant.tenant_id] = tenant.tpm_limit
-        bucket_key = f"tpm:{tenant.tenant_id}"
-        now = self._now()
+        permit_id = uuid.uuid4().hex
+        now_override = f"{self._now():.6f}" if self._now is not None else ""
         try:
             res: Any = self._redis.eval(
                 _RESERVE_LUA,
-                1,
-                bucket_key,
+                2,
+                f"tpm:{tenant.tenant_id}",
+                f"conc:{tenant.tenant_id}",
                 str(tenant.tpm_limit),
-                f"{now:.6f}",
+                now_override,
                 str(est_tokens),
+                str(tenant.max_concurrency),
+                permit_id,
+                f"{self._lease_ttl:.1f}",
             )
-            allowed = int(res[0]) == 1
-            remaining = float(res[1])
-            if not allowed:
+            code = int(res[0])
+            if code == -1:
+                raise BudgetExceededError(
+                    f"Tenant '{tenant.tenant_id}' exceeded concurrency cap "
+                    f"({tenant.max_concurrency}).",
+                    retry_after_seconds=1,
+                )
+            if code == 0:
+                remaining = float(res[1])
                 retry = _retry_after_seconds(est_tokens, remaining, tenant.tpm_limit)
                 raise BudgetExceededError(
                     f"Tenant '{tenant.tenant_id}' exceeded TPM budget.",
                     retry_after_seconds=retry,
                 )
             return Permit(
-                permit_id=uuid.uuid4().hex,
+                permit_id=permit_id,
                 tenant_id=tenant.tenant_id,
                 priority=tenant.priority,
                 model=model,
@@ -268,7 +324,11 @@ class RedisPostgresAdapter:
         except redis.RedisError:
             conservative = replace(
                 tenant,
-                tpm_limit=max(1, int(tenant.tpm_limit * self._degraded_ratio)),
+                tpm_limit=max(
+                    1,
+                    int(tenant.tpm_limit * self._degraded_ratio / self._gateway_replicas),
+                ),
+                max_concurrency=max(1, tenant.max_concurrency // self._gateway_replicas),
             )
             permit = self._local_fallback.reserve(conservative, model, est_tokens)
             return replace(permit, degraded_mode=True)
@@ -278,16 +338,16 @@ class RedisPostgresAdapter:
             self._local_fallback.reconcile(permit, actual_tokens)
             return
         delta = permit.reserved_tokens - actual_tokens
-        if delta == 0:
-            return
         cap = self._tenant_caps.get(permit.tenant_id, max(permit.reserved_tokens, 1))
         try:
             self._redis.eval(
                 _RECONCILE_LUA,
-                1,
+                2,
                 f"tpm:{permit.tenant_id}",
+                f"conc:{permit.tenant_id}",
                 str(delta),
                 str(cap),
+                permit.permit_id,
             )
         except redis.RedisError:
             self._local_fallback.reconcile(permit, actual_tokens)
@@ -298,7 +358,6 @@ class TenantBudget:
 
     def __init__(self, adapter: BudgetAdapter) -> None:
         self._adapter = adapter
-        self._active_permits: dict[str, set[str]] = {}
 
     def authorize_and_reserve(
         self, api_key: str, model: str, est_tokens: int
@@ -309,19 +368,8 @@ class TenantBudget:
         tenant = self._adapter.lookup_tenant(hash_api_key(api_key))
         if tenant is None:
             raise AuthenticationError("Invalid API key.")
-        active = self._active_permits.setdefault(tenant.tenant_id, set())
-        if len(active) >= tenant.max_concurrency:
-            raise BudgetExceededError(
-                f"Tenant '{tenant.tenant_id}' exceeded concurrency cap ({tenant.max_concurrency}).",
-                retry_after_seconds=1,
-            )
-        permit = self._adapter.reserve(tenant, model, est_tokens)
-        active.add(permit.permit_id)
-        return permit
+        return self._adapter.reserve(tenant, model, est_tokens)
 
     def reconcile(self, permit: Permit, actual_tokens: int) -> None:
         """Release concurrency slot and reconcile actual tokens against the issued permit."""
-        active = self._active_permits.get(permit.tenant_id)
-        if active is not None:
-            active.discard(permit.permit_id)
         self._adapter.reconcile(permit, max(0, actual_tokens))

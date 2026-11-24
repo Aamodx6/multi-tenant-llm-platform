@@ -115,3 +115,64 @@ def test_concurrency_cap_blocks_excess_inflight_until_reconcile() -> None:
     budget.reconcile(permit, actual_tokens=5)
     next_permit = budget.authorize_and_reserve("sk-gamma", "pool-8b", est_tokens=10)
     assert next_permit.tenant_id == "gamma"
+
+
+def test_redis_adapter_shares_concurrency_across_pods_sets_reject_ttl_and_scales_degraded() -> None:
+    tenant = TenantRecord(
+        tenant_id="delta",
+        priority=PriorityClass.PAID,
+        tpm_limit=1000,
+        max_concurrency=1,
+    )
+    kh = hash_api_key("sk-delta")
+    fake_redis = fakeredis.FakeRedis(decode_responses=True)
+
+    pod1 = TenantBudget(
+        adapter=RedisPostgresAdapter(
+            redis_client=fake_redis,
+            pg_lookup=lambda h: tenant if h == kh else None,
+        )
+    )
+    pod2 = TenantBudget(
+        adapter=RedisPostgresAdapter(
+            redis_client=fake_redis,
+            pg_lookup=lambda h: tenant if h == kh else None,
+        )
+    )
+
+    # Rejected over-cap reserve still sets EXPIRE on the Redis bucket key
+    with pytest.raises(BudgetExceededError):
+        pod1.authorize_and_reserve("sk-delta", "pool-8b", est_tokens=1500)
+    assert fake_redis.ttl("tpm:delta") > 0
+
+    # Pod 1 holds the single concurrency slot -> Pod 2 is blocked until Pod 1 reconciles
+    p1 = pod1.authorize_and_reserve("sk-delta", "pool-8b", est_tokens=10)
+    with pytest.raises(BudgetExceededError, match="concurrency"):
+        pod2.authorize_and_reserve("sk-delta", "pool-8b", est_tokens=10)
+    pod1.reconcile(p1, actual_tokens=10)
+    p2 = pod2.authorize_and_reserve("sk-delta", "pool-8b", est_tokens=10)
+    pod2.reconcile(p2, actual_tokens=10)
+
+    # Redis outage scales degraded budget by gateway_replicas (1000 * 0.40 / 4 = 100 TPM/pod)
+    class _BrokenRedis:
+        def get(self, *_args: object, **_kwargs: object) -> None:
+            raise redis.ConnectionError("down")
+
+        def set(self, *_args: object, **_kwargs: object) -> None:
+            raise redis.ConnectionError("down")
+
+        def eval(self, *_args: object, **_kwargs: object) -> object:
+            raise redis.ConnectionError("down")
+
+    degraded_pod = TenantBudget(
+        adapter=RedisPostgresAdapter(
+            redis_client=_BrokenRedis(),  # type: ignore[arg-type]
+            pg_lookup=lambda h: tenant if h == kh else None,
+            degraded_tpm_ratio=0.40,
+            gateway_replicas=4,
+        )
+    )
+    p3 = degraded_pod.authorize_and_reserve("sk-delta", "pool-8b", est_tokens=80)
+    assert p3.degraded_mode is True
+    with pytest.raises(BudgetExceededError):
+        degraded_pod.authorize_and_reserve("sk-delta", "pool-8b", est_tokens=30)

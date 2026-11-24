@@ -23,7 +23,7 @@ warn_unused_configs = true
 files = ["catalog", "gateway", "controller", "tests"]
 
 [[tool.mypy.overrides]]
-module = ["yaml", "yaml.*"]
+module = ["yaml", "yaml.*", "sklearn", "sklearn.*"]
 ignore_missing_imports = true
 
 [tool.ruff]

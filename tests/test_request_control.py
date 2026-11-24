@@ -1,5 +1,6 @@
 import asyncio
-from collections.abc import MutableMapping
+import json
+from collections.abc import AsyncIterator, MutableMapping
 from typing import Any
 
 import httpx
@@ -11,6 +12,7 @@ from gateway.request_control import (
     AdmissionPolicy,
     FakeEngineAdapter,
     ReplicaEndpoint,
+    VLLMAdapter,
     create_app,
 )
 from gateway.tenant_budget import (
@@ -347,14 +349,292 @@ async def test_sse_streaming_passthrough_and_client_disconnect_aborts_engine() -
         engine.stream_gate = None
 
         assert engine.aborted == [("8b-0", "trace-abort")]
-        # Full stream used 2+3=5 tokens, aborted stream used 1+1=2 tokens -> 93 left
+        # Full stream used 7+3=10 tokens, aborted stream used 5+1=6 tokens -> 84 left
         tail = await client.post(
             "/v1/chat/completions",
             headers={"Authorization": "Bearer sk-acme"},
             json={
                 "model": "qwen-7b",
-                "max_tokens": 90,
+                "max_tokens": 75,
                 "messages": [{"role": "user", "content": "hi"}],
             },
         )
         assert tail.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_openai_error_envelope_400_validation_and_sse_fields() -> None:
+    catalog = load_and_validate(CATALOG_YAML)
+    tenant = TenantRecord(tenant_id="acme", priority=PriorityClass.PAID, tpm_limit=1000)
+    budget = TenantBudget(adapter=InMemoryBudgetAdapter({hash_api_key("sk-acme"): tenant}))
+    engine = FakeEngineAdapter(
+        replicas={"pool-8b": [ReplicaEndpoint(replica_id="8b-0", url="http://8b-0:8000")]},
+        stream_chunks=["a", "b"],
+    )
+    app = create_app(catalog=catalog, budget=budget, pool_health=PoolHealthStore(), engine=engine)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        bad_json = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme", "Content-Type": "application/json"},
+            content=b"{not-json",
+        )
+        assert bad_json.status_code == 400
+        assert bad_json.json()["error"]["type"] == "invalid_request_error"
+
+        bad_schema = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme"},
+            json={"model": "qwen-7b"},
+        )
+        assert bad_schema.status_code == 400
+        assert bad_schema.json()["error"]["type"] == "invalid_request_error"
+
+        unauth = await client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen-7b", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert unauth.status_code == 401
+        assert unauth.json()["error"]["code"] == "invalid_api_key"
+
+        ok = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme"},
+            json={
+                "model": "qwen-7b",
+                "temperature": 0.2,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert ok.status_code == 200
+        assert isinstance(ok.json()["created"], int)
+
+        chunks: list[dict[str, Any]] = []
+        async with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme"},
+            json={
+                "model": "qwen-7b",
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        ) as resp:
+            async for line in resp.aiter_lines():
+                if line.startswith("data: ") and line != "data: [DONE]":
+                    chunks.append(json.loads(line[6:]))
+
+        assert isinstance(chunks[0]["created"], int)
+        assert chunks[0]["choices"][0]["finish_reason"] is None
+        assert chunks[1]["choices"][0]["finish_reason"] == "stop"
+        assert chunks[-1]["choices"] == []
+        assert chunks[-1]["usage"]["total_tokens"] > 0
+
+
+@pytest.mark.anyio
+async def test_queued_disconnect_refunds_budget_and_chwbl_minimizes_reshuffle() -> None:
+    catalog = load_and_validate(CATALOG_YAML)
+    tenant = TenantRecord(
+        tenant_id="acme", priority=PriorityClass.PAID, tpm_limit=100, max_concurrency=1
+    )
+    gate = asyncio.Event()
+    started = asyncio.Event()
+    replicas = [
+        ReplicaEndpoint(replica_id="8b-0", url="http://8b-0:8000"),
+        ReplicaEndpoint(replica_id="8b-1", url="http://8b-1:8000"),
+        ReplicaEndpoint(replica_id="8b-2", url="http://8b-2:8000"),
+    ]
+    engine = FakeEngineAdapter(
+        replicas={"pool-8b": replicas},
+        completion_tokens=5,
+        complete_gate=gate,
+        on_start=started,
+    )
+    blocker = TenantRecord(
+        tenant_id="blocker", priority=PriorityClass.PAID, tpm_limit=1000, max_concurrency=4
+    )
+    budget2 = TenantBudget(
+        adapter=InMemoryBudgetAdapter(
+            {hash_api_key("sk-acme"): tenant, hash_api_key("sk-block"): blocker}
+        )
+    )
+    app2 = create_app(
+        catalog=catalog,
+        budget=budget2,
+        pool_health=PoolHealthStore(),
+        engine=engine,
+        admission_policy=AdmissionPolicy(
+            max_in_flight=1,
+            estimated_request_ms=100,
+            paid_wait_budget_ms=5000,
+        ),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app2), base_url="http://test"
+    ) as client:
+        t_hold = asyncio.create_task(
+            client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer sk-block"},
+                json={"model": "qwen-7b", "messages": [{"role": "user", "content": "hold"}]},
+            )
+        )
+        await started.wait()
+
+        # Queued acme request cancelled mid-queue
+        t_queued = asyncio.create_task(
+            client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer sk-acme"},
+                json={
+                    "model": "qwen-7b",
+                    "max_tokens": 90,
+                    "messages": [{"role": "user", "content": "wait"}],
+                },
+            )
+        )
+        await asyncio.sleep(0.02)
+        t_queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t_queued
+
+        gate.set()
+        await t_hold
+
+        # Fast-path must still work and acme's concurrency + 90 tokens must be refunded
+        engine_fast = FakeEngineAdapter(replicas={"pool-8b": replicas}, completion_tokens=5)
+        app3 = create_app(
+            catalog=catalog,
+            budget=budget2,
+            pool_health=PoolHealthStore(),
+            engine=engine_fast,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app3), base_url="http://test"
+        ) as c3:
+            after = await c3.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer sk-acme"},
+                json={
+                    "model": "qwen-7b",
+                    "max_tokens": 90,
+                    "messages": [{"role": "user", "content": "ok"}],
+                },
+            )
+            assert after.status_code == 200
+
+    # CHWBL consistency check: adding a 4th replica moves <= ~35% of 20 prefixes (not ~75%)
+    engine_ring = FakeEngineAdapter(replicas={"pool-8b": replicas})
+    app_ring = create_app(
+        catalog=catalog,
+        budget=TenantBudget(
+            adapter=InMemoryBudgetAdapter(
+                {hash_api_key("sk-b"): TenantRecord("b", PriorityClass.PAID, 100_000)}
+            )
+        ),
+        pool_health=PoolHealthStore(),
+        engine=engine_ring,
+    )
+    before_map: dict[str, str] = {}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app_ring), base_url="http://test"
+    ) as client:
+        for i in range(20):
+            r = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer sk-b"},
+                json={
+                    "model": "qwen-7b",
+                    "messages": [{"role": "system", "content": f"sys-prompt-{i}"}],
+                },
+            )
+            before_map[f"sys-prompt-{i}"] = r.headers["x-served-replica"]
+
+        replicas.append(ReplicaEndpoint(replica_id="8b-3", url="http://8b-3:8000"))
+        engine_ring.set_replicas("pool-8b", replicas)
+        moved = 0
+        for i in range(20):
+            r = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer sk-b"},
+                json={
+                    "model": "qwen-7b",
+                    "messages": [{"role": "system", "content": f"sys-prompt-{i}"}],
+                },
+            )
+            if r.headers["x-served-replica"] != before_map[f"sys-prompt-{i}"]:
+                moved += 1
+        assert moved <= 9
+
+
+@pytest.mark.anyio
+async def test_vllm_adapter_parses_sse_usage_aborts_by_closing_stream_and_scrapes_metrics() -> None:
+    seen_payloads: list[dict[str, Any]] = []
+    seen_urls: list[str] = []
+    stream_closed = False
+
+    class _MockSSEStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n'
+            yield b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'
+            yield (
+                b'data: {"choices":[],"usage":{"prompt_tokens":4,'
+                b'"completion_tokens":2,"total_tokens":6}}\n\n'
+            )
+            yield b"data: [DONE]\n\n"
+
+        async def aclose(self) -> None:
+            nonlocal stream_closed
+            stream_closed = True
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(request.url))
+        if request.url.path == "/metrics":
+            return httpx.Response(
+                200,
+                text=(
+                    "# HELP vllm:num_requests_waiting Waiting\n"
+                    'vllm:num_requests_waiting{model_name="Qwen/Qwen2.5-7B-Instruct"} 3.0\n'
+                    'vllm:kv_cache_usage_perc{model_name="Qwen/Qwen2.5-7B-Instruct"} 0.42\n'
+                ),
+            )
+        body = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(body)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_MockSSEStream(),
+        )
+
+    rep = ReplicaEndpoint(replica_id="8b-0", url="http://vllm-0:8000")
+    adapter = VLLMAdapter(
+        replicas={"pool-8b": [rep]},
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    await adapter.scrape_metrics()
+    assert rep.requests_waiting == 3
+    assert rep.kv_cache_usage == pytest.approx(0.42)
+
+    chunks = [
+        c
+        async for c in adapter.stream(
+            replica=rep,
+            model_id="Qwen/Qwen2.5-7B-Instruct",
+            request_id="req-1",
+            payload={"messages": [{"role": "user", "content": "hi"}], "temperature": 0.1},
+        )
+    ]
+    assert seen_payloads[0]["stream_options"] == {"include_usage": True}
+    assert seen_payloads[0]["temperature"] == 0.1
+    assert [c.delta for c in chunks if c.delta] == ["hel", "lo"]
+    assert chunks[-1].prompt_tokens == 4
+    assert chunks[-1].completion_tokens_so_far == 2
+
+    # Abort must NOT call /v1/abort
+    await adapter.abort(replica=rep, request_id="req-1")
+    assert all("/v1/abort" not in u for u in seen_urls)
+    assert stream_closed is True

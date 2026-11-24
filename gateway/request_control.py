@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 import hashlib
 import heapq
 import json
+import math
+import re
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+import anyio
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -26,9 +31,16 @@ from gateway.tenant_budget import (
     TenantBudget,
 )
 
+_VNODE_COUNT = 64
+_PROM_METRIC_RE = re.compile(
+    r"^(vllm:(?:num_requests_waiting|kv_cache_usage_perc))(?:\{[^}]*\})?\s+([0-9eE.+_-]+)$"
+)
+
 
 class ChatMessage(BaseModel):
     """OpenAI-compatible chat message."""
+
+    model_config = ConfigDict(extra="allow")
 
     role: str
     content: str
@@ -37,10 +49,13 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     """OpenAI-compatible chat completion request payload."""
 
+    model_config = ConfigDict(extra="allow")
+
     model: str
     messages: list[ChatMessage]
     max_tokens: int = Field(default=256, ge=1, le=32768)
     stream: bool = False
+    stream_options: dict[str, Any] | None = None
 
 
 @dataclass
@@ -69,6 +84,7 @@ class StreamChunk:
 
     delta: str
     completion_tokens_so_far: int = 0
+    prompt_tokens: int | None = None
     finished: bool = False
 
 
@@ -114,7 +130,7 @@ class _AdmissionShedError(RuntimeError):
 
 
 class _PriorityAdmission:
-    """In-process priority queue enforcing wait budgets without Redis."""
+    """Cancellation-safe in-process priority queue enforcing wait budgets without Redis."""
 
     def __init__(self, policy: AdmissionPolicy) -> None:
         self._policy = policy
@@ -122,7 +138,12 @@ class _PriorityAdmission:
         self._seq = 0
         self._waiters: list[tuple[int, int, asyncio.Future[None]]] = []
 
+    def _prune_done_waiters(self) -> None:
+        while self._waiters and self._waiters[0][2].done():
+            heapq.heappop(self._waiters)
+
     async def acquire(self, priority: PriorityClass) -> None:
+        self._prune_done_waiters()
         if self._in_flight < self._policy.max_in_flight and not self._waiters:
             self._in_flight += 1
             return
@@ -145,7 +166,10 @@ class _PriorityAdmission:
         try:
             await fut
         except BaseException:
-            fut.cancel()
+            if fut.done() and not fut.cancelled():
+                self.release()
+            else:
+                fut.cancel()
             raise
 
     def release(self) -> None:
@@ -182,6 +206,9 @@ class FakeEngineAdapter:
     def list_replicas(self, pool: str) -> list[ReplicaEndpoint]:
         return list(self._replicas.get(pool, []))
 
+    def set_replicas(self, pool: str, replicas: list[ReplicaEndpoint]) -> None:
+        self._replicas[pool] = list(replicas)
+
     async def complete(
         self,
         *,
@@ -212,13 +239,16 @@ class FakeEngineAdapter:
         payload: dict[str, Any],
     ) -> AsyncIterator[StreamChunk]:
         self.dispatched.append((replica.replica_id, model_id, request_id))
+        prompt_tokens = _estimate_prompt_tokens(payload.get("messages", []))
         for idx, token in enumerate(self._stream_chunks, start=1):
             if idx > 1 and self.stream_gate is not None:
                 await self.stream_gate.wait()
+            is_last = idx == len(self._stream_chunks)
             yield StreamChunk(
                 delta=token,
                 completion_tokens_so_far=idx,
-                finished=(idx == len(self._stream_chunks)),
+                prompt_tokens=prompt_tokens if is_last else None,
+                finished=is_last,
             )
 
     async def abort(self, *, replica: ReplicaEndpoint, request_id: str) -> None:
@@ -235,10 +265,36 @@ class VLLMAdapter:
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._replicas = {k: list(v) for k, v in replicas.items()}
-        self._client = client or httpx.AsyncClient(timeout=60.0)
+        self._client = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
+        )
+        self._active_streams: dict[str, httpx.Response] = {}
 
     def list_replicas(self, pool: str) -> list[ReplicaEndpoint]:
         return list(self._replicas.get(pool, []))
+
+    def set_replicas(self, pool: str, replicas: list[ReplicaEndpoint]) -> None:
+        self._replicas[pool] = list(replicas)
+
+    async def scrape_metrics(self) -> None:
+        """Poll vLLM /metrics on all replicas to refresh queue and KV-cache load."""
+        for pool_replicas in self._replicas.values():
+            for replica in pool_replicas:
+                try:
+                    resp = await self._client.get(f"{replica.url}/metrics")
+                    resp.raise_for_status()
+                except httpx.HTTPError:
+                    continue
+                for line in resp.text.splitlines():
+                    match = _PROM_METRIC_RE.match(line.strip())
+                    if not match:
+                        continue
+                    metric, raw_val = match.group(1), match.group(2)
+                    val = float(raw_val)
+                    if metric == "vllm:num_requests_waiting":
+                        replica.requests_waiting = int(val)
+                    elif metric == "vllm:kv_cache_usage_perc":
+                        replica.kv_cache_usage = val
 
     async def complete(
         self,
@@ -273,7 +329,13 @@ class VLLMAdapter:
         request_id: str,
         payload: dict[str, Any],
     ) -> AsyncIterator[StreamChunk]:
-        body = {**payload, "model": model_id, "stream": True}
+        body = {
+            **payload,
+            "model": model_id,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        completion_count = 0
         async with self._client.stream(
             "POST",
             f"{replica.url}/v1/chat/completions",
@@ -281,25 +343,66 @@ class VLLMAdapter:
             headers={"x-request-id": request_id},
         ) as resp:
             resp.raise_for_status()
-            count = 0
-            async for line in resp.aiter_lines():
-                if line.startswith("data: ") and line != "data: [DONE]":
-                    count += 1
-                    yield StreamChunk(delta=line[6:], completion_tokens_so_far=count)
+            self._active_streams[request_id] = resp
+            try:
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    raw = line[6:].strip()
+                    if raw == "[DONE]":
+                        break
+                    event = json.loads(raw)
+                    usage = event.get("usage")
+                    choices = event.get("choices") or []
+                    if not choices:
+                        if isinstance(usage, dict):
+                            yield StreamChunk(
+                                delta="",
+                                completion_tokens_so_far=int(
+                                    usage.get("completion_tokens", completion_count)
+                                ),
+                                prompt_tokens=int(usage["prompt_tokens"])
+                                if "prompt_tokens" in usage
+                                else None,
+                                finished=True,
+                            )
+                        continue
+                    choice = choices[0]
+                    delta_text = str(choice.get("delta", {}).get("content") or "")
+                    if delta_text:
+                        completion_count += 1
+                    finished = choice.get("finish_reason") is not None
+                    yield StreamChunk(
+                        delta=delta_text,
+                        completion_tokens_so_far=int(
+                            usage.get("completion_tokens", completion_count)
+                            if isinstance(usage, dict)
+                            else completion_count
+                        ),
+                        prompt_tokens=int(usage["prompt_tokens"])
+                        if isinstance(usage, dict) and "prompt_tokens" in usage
+                        else None,
+                        finished=finished,
+                    )
+            finally:
+                self._active_streams.pop(request_id, None)
 
     async def abort(self, *, replica: ReplicaEndpoint, request_id: str) -> None:
-        await self._client.post(
-            f"{replica.url}/v1/abort",
-            json={"request_id": request_id},
-        )
+        """Close the active upstream HTTP stream so vLLM cancels generation."""
+        _ = replica
+        resp = self._active_streams.pop(request_id, None)
+        if resp is not None:
+            await resp.aclose()
 
 
 def _estimate_prompt_tokens(messages: list[dict[str, Any]] | list[ChatMessage]) -> int:
-    total_words = 0
+    """Conservative UTF-8 byte-ratio + ChatML framing estimate for Qwen2.5 BPE."""
+    total = 0
     for msg in messages:
         content = msg.content if isinstance(msg, ChatMessage) else str(msg.get("content", ""))
-        total_words += max(1, len(content.split()))
-    return max(1, total_words)
+        byte_len = len(content.encode("utf-8"))
+        total += max(1, math.ceil(byte_len / 3.0)) + 4
+    return max(1, total)
 
 
 def _extract_api_key(request: Request) -> str:
@@ -307,6 +410,28 @@ def _extract_api_key(request: Request) -> str:
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
     return ""
+
+
+def _error_response(
+    *,
+    message: str,
+    status_code: int,
+    error_type: str,
+    code: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": None,
+                "code": code,
+            }
+        },
+        status_code=status_code,
+        headers=headers,
+    )
 
 
 @dataclass(frozen=True)
@@ -378,13 +503,26 @@ def create_app(
 
     async def chat_completions(request: Request) -> Response:
         trace_id = request.headers.get("x-trace-id") or uuid.uuid4().hex
-        raw_body = await request.json()
-        req = ChatCompletionRequest.model_validate(raw_body)
+        try:
+            raw_body = await request.json()
+            req = ChatCompletionRequest.model_validate(raw_body)
+        except (json.JSONDecodeError, ValueError, ValidationError) as exc:
+            return _error_response(
+                message=f"Invalid request body: {exc}",
+                status_code=400,
+                error_type="invalid_request_error",
+                code="invalid_request",
+            )
 
         try:
             pool_spec = deps.catalog.resolve_alias(req.model)
         except KeyError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=404)
+            return _error_response(
+                message=str(exc),
+                status_code=404,
+                error_type="invalid_request_error",
+                code="model_not_found",
+            )
 
         est_prompt = _estimate_prompt_tokens(req.messages)
         est_total = est_prompt + req.max_tokens
@@ -395,11 +533,18 @@ def create_app(
                 est_total,
             )
         except AuthenticationError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=401)
+            return _error_response(
+                message=str(exc),
+                status_code=401,
+                error_type="authentication_error",
+                code="invalid_api_key",
+            )
         except BudgetExceededError as exc:
-            return JSONResponse(
-                {"error": str(exc)},
+            return _error_response(
+                message=str(exc),
                 status_code=429,
+                error_type="rate_limit_exceeded",
+                code="rate_limit_exceeded",
                 headers={"Retry-After": str(exc.retry_after_seconds)},
             )
 
@@ -407,11 +552,16 @@ def create_app(
             await deps.admission.acquire(permit.priority)
         except _AdmissionShedError as exc:
             deps.budget.reconcile(permit, 0)
-            return JSONResponse(
-                {"error": str(exc)},
+            return _error_response(
+                message=str(exc),
                 status_code=429,
+                error_type="rate_limit_exceeded",
+                code="queue_wait_exceeded",
                 headers={"Retry-After": str(exc.retry_after_seconds)},
             )
+        except BaseException:
+            deps.budget.reconcile(permit, 0)
+            raise
 
         target_pool, replica = _select_pool_and_replica(
             deps=deps,
@@ -421,7 +571,13 @@ def create_app(
         if replica is None:
             deps.admission.release()
             deps.budget.reconcile(permit, 0)
-            return JSONResponse({"error": "No healthy replicas available"}, status_code=503)
+            return _error_response(
+                message="No healthy replicas available",
+                status_code=503,
+                error_type="server_error",
+                code="service_unavailable",
+                headers={"Retry-After": "5"},
+            )
 
         if req.stream:
             return _streaming_chat_response(
@@ -457,6 +613,7 @@ def create_app(
             {
                 "id": f"chatcmpl-{trace_id}",
                 "object": "chat.completion",
+                "created": int(time.time()),
                 "model": target_pool.model_id,
                 "choices": [
                     {
@@ -488,40 +645,76 @@ def _streaming_chat_response(
     est_prompt: int,
     trace_id: str,
 ) -> StreamingResponse:
+    include_usage = bool(
+        req.stream_options and req.stream_options.get("include_usage", False)
+    )
+    created = int(time.time())
+
     async def event_stream() -> AsyncIterator[str]:
         completed = False
         emitted_tokens = 0
+        actual_prompt_tokens: int | None = None
+        stream_iter = deps.engine.stream(
+            replica=replica,
+            model_id=target_pool.model_id,
+            request_id=trace_id,
+            payload=req.model_dump(),
+        )
         try:
-            async for chunk in deps.engine.stream(
-                replica=replica,
-                model_id=target_pool.model_id,
-                request_id=trace_id,
-                payload=req.model_dump(),
-            ):
+            async for chunk in stream_iter:
                 if await request.is_disconnected():
                     break
                 emitted_tokens = chunk.completion_tokens_so_far
+                if chunk.prompt_tokens is not None:
+                    actual_prompt_tokens = chunk.prompt_tokens
+                if not chunk.delta and not chunk.finished:
+                    continue
+                if not chunk.delta and chunk.finished:
+                    continue
                 payload = {
                     "id": f"chatcmpl-{trace_id}",
                     "object": "chat.completion.chunk",
+                    "created": created,
                     "model": target_pool.model_id,
-                    "choices": [{"index": 0, "delta": {"content": chunk.delta}}],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": chunk.delta},
+                            "finish_reason": "stop" if chunk.finished else None,
+                        }
+                    ],
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
             else:
                 completed = True
+                if include_usage:
+                    prompt_used = (
+                        actual_prompt_tokens if actual_prompt_tokens is not None else est_prompt
+                    )
+                    usage_payload = {
+                        "id": f"chatcmpl-{trace_id}",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": target_pool.model_id,
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": prompt_used,
+                            "completion_tokens": emitted_tokens,
+                            "total_tokens": prompt_used + emitted_tokens,
+                        },
+                    }
+                    yield f"data: {json.dumps(usage_payload)}\n\n"
                 yield "data: [DONE]\n\n"
         finally:
             try:
                 if not completed:
-                    try:
+                    with anyio.CancelScope(shield=True):
                         await deps.engine.abort(replica=replica, request_id=trace_id)
-                    except RuntimeError:
-                        asyncio.get_running_loop().create_task(
-                            deps.engine.abort(replica=replica, request_id=trace_id)
-                        )
             finally:
-                total_tokens = est_prompt + emitted_tokens
+                prompt_used = (
+                    actual_prompt_tokens if actual_prompt_tokens is not None else est_prompt
+                )
+                total_tokens = prompt_used + emitted_tokens
                 _record_usage_and_reconcile(
                     deps=deps,
                     permit=permit,
@@ -545,19 +738,53 @@ def _extract_prefix(messages: list[ChatMessage]) -> str:
     return messages[0].content[:256] if messages else ""
 
 
+def _hash64(value: str) -> int:
+    return int.from_bytes(hashlib.sha256(value.encode("utf-8")).digest()[:8], "big")
+
+
 def _pick_replica(
-    pool: ModelPoolSpec, replicas: list[ReplicaEndpoint], prefix: str
+    pool: ModelPoolSpec,
+    replicas: list[ReplicaEndpoint],
+    prefix: str,
+    *,
+    epsilon: float = 0.25,
 ) -> ReplicaEndpoint:
-    ordered = sorted(replicas, key=lambda r: r.replica_id)
-    digest = hashlib.sha256(prefix.encode("utf-8")).digest()
-    idx = int.from_bytes(digest[:8], "big") % len(ordered)
-    candidate = ordered[idx]
-    if (
-        candidate.requests_waiting <= pool.keda_waiting_threshold
-        and candidate.kv_cache_usage <= pool.keda_kv_cache_threshold
-    ):
-        return candidate
-    return min(ordered, key=lambda r: (r.requests_waiting, r.kv_cache_usage, r.replica_id))
+    """Consistent Hashing with Bounded Loads (CHWBL) across replica virtual nodes."""
+    by_id = {r.replica_id: r for r in replicas}
+    ring: list[tuple[int, str]] = []
+    for rep_id in by_id:
+        for vnode in range(_VNODE_COUNT):
+            ring.append((_hash64(f"{rep_id}#{vnode}"), rep_id))
+    ring.sort()
+
+    avg_load = sum(r.requests_waiting for r in replicas) / len(replicas)
+    waiting_cap = (
+        min(pool.keda_waiting_threshold, max(1, math.ceil((1.0 + epsilon) * avg_load)))
+        if avg_load > 0.0
+        else pool.keda_waiting_threshold
+    )
+
+    ring_hashes = [h for h, _ in ring]
+    start_idx = bisect.bisect_left(ring_hashes, _hash64(prefix))
+    visited: set[str] = set()
+    for offset in range(len(ring)):
+        rep_id = ring[(start_idx + offset) % len(ring)][1]
+        if rep_id in visited:
+            continue
+        visited.add(rep_id)
+        candidate = by_id[rep_id]
+        if (
+            candidate.requests_waiting <= waiting_cap
+            and candidate.kv_cache_usage <= pool.keda_kv_cache_threshold
+        ):
+            return candidate
+        if len(visited) == len(by_id):
+            break
+
+    return min(
+        replicas,
+        key=lambda r: (r.requests_waiting, r.kv_cache_usage, r.replica_id),
+    )
 
 
 def _select_pool_and_replica(

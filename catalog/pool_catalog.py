@@ -30,6 +30,9 @@ class ModelPoolSpec(BaseModel):
     fallback_pool: str | None = None
     prefetch_uri: str | None = None
     warmup_prompt: str = "Hello"
+    max_model_len: int = Field(default=8192, gt=0)
+    gpu_memory_utilization: float = Field(default=0.90, gt=0.0, le=1.0)
+    enable_prefix_caching: bool = True
     min_replicas: int = Field(ge=0)
     max_replicas: int = Field(ge=1)
     keda_waiting_threshold: int = Field(gt=0)
@@ -94,13 +97,39 @@ class ModelPoolCatalog:
             }
             for name, spec in self.pools.items()
         }
+        vllm_args = {
+            name: _build_vllm_args(spec)
+            for name, spec in self.pools.items()
+            if spec.engine == "vllm"
+        }
         return {
             "request_control_aliases": dict(self._aliases),
             "request_control_fallbacks": request_control_fallbacks,
             "keda_triggers": keda_triggers,
             "rollout_slos": rollout_slos,
             "prefetch_targets": prefetch_targets,
+            "vllm_args": vllm_args,
         }
+
+
+def _build_vllm_args(spec: ModelPoolSpec) -> list[str]:
+    args = [
+        "--model",
+        spec.model_id,
+        "--served-model-name",
+        spec.model_id,
+        "--dtype",
+        "auto",
+        "--max-model-len",
+        str(spec.max_model_len),
+        "--gpu-memory-utilization",
+        f"{spec.gpu_memory_utilization:.2f}",
+    ]
+    if spec.quantization not in {"fp16", "bf16", "auto"}:
+        args.extend(["--quantization", spec.quantization])
+    if spec.enable_prefix_caching:
+        args.append("--enable-prefix-caching")
+    return args
 
 
 def load_and_validate(catalog_yaml: str) -> ModelPoolCatalog:

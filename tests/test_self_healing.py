@@ -1,11 +1,17 @@
+import pytest
+
 from controller.self_healing import (
     ActionKind,
     AuditEntry,
     GuardrailState,
+    K8sActuatorAdapter,
+    K8sPodRef,
+    PDBBlockedError,
     PodTelemetry,
     SelfHealingEngine,
     SimulatedActuatorAdapter,
     TelemetryWindow,
+    compute_z_score,
 )
 from gateway.pool_health import HealthState, PoolHealthStore
 
@@ -159,3 +165,103 @@ def test_ttft_zscore_anomaly_with_elevated_kv_marks_pool_degraded() -> None:
         (a.kind, a.target) for a in plan.actions
     ]
     assert pool_health.get_state("pool-8b").state == HealthState.DEGRADED
+
+
+def test_mad_zscore_ignores_jitter_and_survives_prior_outliers() -> None:
+    # Tiny sub-ms jitter on flat baseline must NOT false-trigger
+    assert compute_z_score([100.0, 100.0, 100.0, 100.0, 100.2]) < 1.0
+
+    # Prior spike in baseline must NOT mask a subsequent 460ms spike
+    assert compute_z_score([100.0, 450.0, 102.0, 99.0, 101.0, 460.0]) > 3.5
+
+
+def test_multivariate_isolation_forest_flags_joint_degradation() -> None:
+    pool_health = PoolHealthStore()
+    actuator = SimulatedActuatorAdapter()
+    baseline = [
+        (100.0, 0.30, 62.0),
+        (105.0, 0.35, 63.0),
+        (98.0, 0.28, 61.0),
+        (102.0, 0.32, 62.5),
+        (104.0, 0.31, 63.0),
+        (101.0, 0.33, 62.0),
+        (99.0, 0.29, 61.5),
+        (103.0, 0.34, 62.8),
+        (100.0, 0.30, 62.2),
+        (102.0, 0.31, 62.4),
+    ]
+    engine = SelfHealingEngine(
+        actuator=actuator,
+        pool_health=pool_health,
+        baseline_features=baseline,
+    )
+
+    # Jointly elevated TTFT (280ms), KV (0.88), temp (81C) — below hard thresholds (95%, 85C)
+    plan = engine.reconcile(
+        TelemetryWindow(
+            timestamp=400.0,
+            pods=[
+                PodTelemetry(
+                    pod="vllm-8b-3",
+                    node="gpu-node-4",
+                    pool="pool-8b",
+                    kv_cache_usage=0.88,
+                    gpu_temp_c=81.0,
+                    ttft_ms_series=[100.0, 102.0, 101.0, 280.0],
+                )
+            ],
+        ),
+        GuardrailState(),
+    )
+    assert (ActionKind.MARK_POOL_DEGRADED, "pool-8b") in [
+        (a.kind, a.target) for a in plan.actions
+    ]
+
+
+def test_k8s_actuator_cordons_skips_daemonsets_and_retries_pdb_429() -> None:
+    cordoned: list[str] = []
+    evicted: list[str] = []
+    attempts = {"vllm-0": 0}
+
+    class _FakeK8sClient:
+        def cordon_node(self, node: str) -> None:
+            cordoned.append(node)
+
+        def list_node_pods(self, node: str) -> list[K8sPodRef]:
+            _ = node
+            return [
+                K8sPodRef(namespace="telemetry", name="dcgm-exporter", is_daemonset=True),
+                K8sPodRef(namespace="llm", name="vllm-0", is_daemonset=False),
+            ]
+
+        def evict_pod(self, namespace: str, name: str) -> None:
+            _ = namespace
+            attempts[name] = attempts.get(name, 0) + 1
+            if attempts[name] == 1:
+                raise PDBBlockedError("429 Too Many Requests: PDB active")
+            evicted.append(name)
+
+        def delete_pod(self, namespace: str, name: str) -> None:
+            _ = (namespace, name)
+
+        def page_human(self, target: str, reason: str) -> None:
+            _ = (target, reason)
+
+    adapter = K8sActuatorAdapter(
+        client=_FakeK8sClient(),
+        max_eviction_retries=2,
+        backoff_seconds=0.0,
+    )
+    adapter.cordon_and_drain("gpu-node-1", "xid_error")
+    assert cordoned == ["gpu-node-1"]
+    assert evicted == ["vllm-0"]
+
+    # Exceeding max_eviction_retries raises RuntimeError
+    attempts["vllm-0"] = 0
+    adapter_strict = K8sActuatorAdapter(
+        client=_FakeK8sClient(),
+        max_eviction_retries=1,
+        backoff_seconds=0.0,
+    )
+    with pytest.raises(RuntimeError, match="PDB"):
+        adapter_strict.cordon_and_drain("gpu-node-1", "xid_error")

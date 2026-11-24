@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import math
-from collections.abc import Callable
+import statistics
+import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
+
+from sklearn.ensemble import IsolationForest
 
 from gateway.pool_health import PoolHealth
 
@@ -16,6 +19,33 @@ class ActionKind(StrEnum):
     MARK_POOL_DEGRADED = "mark_pool_degraded"
     RESTART_POD = "restart_pod"
     ESCALATE_TO_HUMAN = "escalate_to_human"
+
+
+class PDBBlockedError(RuntimeError):
+    """Raised by K8sNodeClient.evict_pod when a PodDisruptionBudget returns HTTP 429."""
+
+
+@dataclass(frozen=True)
+class K8sPodRef:
+    """Reference to a pod scheduled on a Kubernetes node."""
+
+    namespace: str
+    name: str
+    is_daemonset: bool = False
+
+
+class K8sNodeClient(Protocol):
+    """Port abstracting Kubernetes cordon, list, policy/v1 eviction, delete, and paging."""
+
+    def cordon_node(self, node: str) -> None: ...
+
+    def list_node_pods(self, node: str) -> list[K8sPodRef]: ...
+
+    def evict_pod(self, namespace: str, name: str) -> None: ...
+
+    def delete_pod(self, namespace: str, name: str) -> None: ...
+
+    def page_human(self, target: str, reason: str) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -116,40 +146,69 @@ class SimulatedActuatorAdapter:
 
 
 class K8sActuatorAdapter:
-    """Production ClusterActuator adapter delegating node drains, restarts, and paging."""
+    """Production ClusterActuator performing cordon and policy/v1 PDB-aware Eviction."""
 
     def __init__(
         self,
         *,
-        drain_fn: Callable[[str, str], None],
-        restart_fn: Callable[[str, str], None],
-        page_fn: Callable[[str, str], None],
+        client: K8sNodeClient,
+        default_namespace: str = "llm",
+        max_eviction_retries: int = 5,
+        backoff_seconds: float = 2.0,
     ) -> None:
-        self._drain_fn = drain_fn
-        self._restart_fn = restart_fn
-        self._page_fn = page_fn
+        self._client = client
+        self._default_namespace = default_namespace
+        self._max_eviction_retries = max_eviction_retries
+        self._backoff_seconds = backoff_seconds
 
     def cordon_and_drain(self, node: str, reason: str) -> None:
-        self._drain_fn(node, reason)
+        """Cordon node and evict non-DaemonSet pods with 429 PDB retry."""
+        _ = reason
+        self._client.cordon_node(node)
+        for pod in self._client.list_node_pods(node):
+            if pod.is_daemonset:
+                continue
+            self._evict_with_retry(pod)
+
+    def _evict_with_retry(self, pod: K8sPodRef) -> None:
+        for attempt in range(self._max_eviction_retries):
+            try:
+                self._client.evict_pod(pod.namespace, pod.name)
+                return
+            except PDBBlockedError as exc:
+                if attempt + 1 >= self._max_eviction_retries:
+                    raise RuntimeError(
+                        f"PDB blocked eviction of {pod.namespace}/{pod.name} "
+                        f"after {self._max_eviction_retries} attempts"
+                    ) from exc
+                if self._backoff_seconds > 0.0:
+                    time.sleep(self._backoff_seconds * (2**attempt))
 
     def restart_pod(self, pod: str, reason: str) -> None:
-        self._restart_fn(pod, reason)
+        _ = reason
+        namespace, _, name = pod.partition("/")
+        if not name:
+            namespace, name = self._default_namespace, pod
+        self._client.delete_pod(namespace, name)
 
     def page_human(self, target: str, reason: str) -> None:
-        self._page_fn(target, reason)
+        self._client.page_human(target, reason)
 
 
-def compute_z_score(series: list[float]) -> float:
-    """Compute the latest-sample z-score against prior points in a telemetry series."""
+def compute_z_score(series: list[float], *, min_delta_ms: float = 25.0) -> float:
+    """Compute Iglewicz-Hoaglin MAD Modified Z-Score for the latest telemetry point."""
     if len(series) < 3:
         return 0.0
     baseline = series[:-1]
-    mean = sum(baseline) / len(baseline)
-    variance = sum((x - mean) ** 2 for x in baseline) / len(baseline)
-    std = math.sqrt(variance)
-    if std < 1e-6:
-        return 0.0 if abs(series[-1] - mean) < 1e-6 else 10.0
-    return (series[-1] - mean) / std
+    med = statistics.median(baseline)
+    deviations = [abs(x - med) for x in baseline]
+    mad = statistics.median(deviations)
+    latest_diff = abs(series[-1] - med)
+    if mad < 1e-6:
+        return 0.0 if latest_diff < min_delta_ms else 10.0
+    if latest_diff < min_delta_ms:
+        return 0.0
+    return 0.6745 * (series[-1] - med) / mad
 
 
 class SelfHealingEngine:
@@ -163,7 +222,8 @@ class SelfHealingEngine:
         degraded_ttl_seconds: float = 120.0,
         thermal_threshold_c: float = 85.0,
         kv_cache_threshold: float = 0.95,
-        z_score_threshold: float = 3.0,
+        z_score_threshold: float = 3.5,
+        baseline_features: Sequence[tuple[float, float, float]] | None = None,
     ) -> None:
         self._actuator = actuator
         self._pool_health = pool_health
@@ -171,10 +231,21 @@ class SelfHealingEngine:
         self._thermal_threshold_c = thermal_threshold_c
         self._kv_threshold = kv_cache_threshold
         self._z_score_threshold = z_score_threshold
+        self._iso_forest: IsolationForest | None = None
+        if baseline_features and len(baseline_features) >= 5:
+            model = IsolationForest(contamination=0.05, random_state=42)
+            model.fit(list(baseline_features))
+            self._iso_forest = model
 
     def complete_drain(self, guardrails: GuardrailState, node: str) -> None:
         """Clear an in-progress node drain once eviction completes."""
         guardrails.draining_nodes.discard(node)
+
+    def _is_multivariate_anomaly(self, pod: PodTelemetry) -> bool:
+        if self._iso_forest is None or not pod.ttft_ms_series:
+            return False
+        point = [[pod.ttft_ms_series[-1], pod.kv_cache_usage, pod.gpu_temp_c]]
+        return int(self._iso_forest.predict(point)[0]) == -1
 
     def reconcile(
         self,
@@ -198,7 +269,9 @@ class SelfHealingEngine:
             if pod.kv_cache_usage >= self._kv_threshold or pod.oom_restarts > 0:
                 candidates.append((ActionKind.MARK_POOL_DEGRADED, pod.pool, "kv_or_oom_pressure"))
                 candidates.append((ActionKind.RESTART_POD, pod.pod, "kv_or_oom_pressure"))
-            elif z >= self._z_score_threshold and pod.kv_cache_usage >= 0.80:
+            elif (z >= self._z_score_threshold and pod.kv_cache_usage >= 0.80) or (
+                self._is_multivariate_anomaly(pod)
+            ):
                 candidates.append(
                     (ActionKind.MARK_POOL_DEGRADED, pod.pool, "ttft_anomaly_pressure")
                 )
