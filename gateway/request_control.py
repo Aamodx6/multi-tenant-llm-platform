@@ -285,7 +285,7 @@ class VLLMAdapter:
     ) -> None:
         self._replicas = {k: list(v) for k, v in replicas.items()}
         self._client = client or httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
+            timeout=httpx.Timeout(connect=2.0, read=120.0, write=10.0, pool=5.0)
         )
         self._active_streams: dict[str, list[httpx.Response]] = {}
         self._loaded_loras: set[tuple[str, str]] = set()
@@ -846,8 +846,22 @@ def create_app(
                 request_id=trace_id,
                 payload=upstream_payload,
             )
-        finally:
+        except httpx.HTTPError as exc:
             deps.admission.release()
+            deps.budget.reconcile(permit, 0)
+            _record_status(deps, pool=target_pool.name, priority=str(permit.priority), status="503")
+            return _error_response(
+                message=f"Inference upstream unavailable: {exc}",
+                status_code=503,
+                error_type="server_error",
+                code="service_unavailable",
+                headers={"Retry-After": "5"},
+            )
+        except BaseException:
+            deps.admission.release()
+            deps.budget.reconcile(permit, 0)
+            raise
+        deps.admission.release()
 
         if deps.metrics is not None:
             deps.metrics.e2el_seconds.labels(

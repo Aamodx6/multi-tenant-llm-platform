@@ -984,3 +984,55 @@ async def test_vllm_adapter_singleflight_and_reloads_lora_on_404() -> None:
     assert res.content == "reloaded-ok"
     assert len(load_calls) == 2
     assert chat_attempts == 2
+
+
+@pytest.mark.anyio
+async def test_upstream_http_error_returns_503_and_refunds_budget() -> None:
+    def failing_handler(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("timed out connecting to vllm")
+
+    catalog = load_and_validate(CATALOG_YAML)
+    vllm = VLLMAdapter(
+        replicas={"pool-8b": [ReplicaEndpoint("8b-0", "http://vllm-down:8000")]},
+        client=httpx.AsyncClient(transport=httpx.MockTransport(failing_handler)),
+    )
+    app = create_app(
+        catalog=catalog,
+        budget=TenantBudget(
+            adapter=InMemoryBudgetAdapter(
+                {
+                    hash_api_key("sk-a"): TenantRecord(
+                        "tenant-a", PriorityClass.PAID, tpm_limit=100, max_concurrency=1
+                    )
+                }
+            )
+        ),
+        pool_health=PoolHealthStore(),
+        engine=vllm,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r1 = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-a"},
+            json={
+                "model": "qwen-7b",
+                "max_tokens": 80,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        assert r1.status_code == 503
+        assert r1.json()["error"]["code"] == "service_unavailable"
+
+        # Concurrency=1 and tpm_limit=100 must both be refunded so a second request isn't 429
+        r2 = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-a"},
+            json={
+                "model": "qwen-7b",
+                "max_tokens": 80,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        assert r2.status_code == 503
