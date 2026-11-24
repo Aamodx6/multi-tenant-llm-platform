@@ -9,12 +9,11 @@ RUN groupadd --gid 10001 appgroup && \
     useradd --uid 10001 --gid appgroup --no-create-home --shell /usr/sbin/nologin appuser
 
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir .
-
 COPY catalog ./catalog
 COPY gateway ./gateway
 COPY controller ./controller
 COPY observability ./observability
+RUN pip install --no-cache-dir .
 
 USER 10001:10001
 EXPOSE 8080

@@ -15,6 +15,9 @@ dependencies = [
   "uvicorn>=0.30",
 ]
 
+[tool.setuptools.packages.find]
+include = ["catalog*", "gateway*", "controller*", "observability*", "bench*", "deploy*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

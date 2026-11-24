@@ -26,9 +26,16 @@ services:
   grafana:
     image: grafana/grafana:11.3.0
     ports:
-      - "3000:3000"
+      - "3001:3000"
     environment:
       GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/generated/grafana-dashboard.json:/var/lib/grafana/dashboards/llm-platform.json:ro
+    depends_on:
+      - prometheus
 
   vllm-local:
     image: vllm/vllm-openai:v0.7.3
