@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: weight-prefetch
+  namespace: llm
+  labels:
+    app: weight-prefetch
+spec:
+  selector:
+    matchLabels:
+      app: weight-prefetch
+  template:
+    metadata:
+      labels:
+        app: weight-prefetch
+    spec:
+      serviceAccountName: weight-prefetcher
+      nodeSelector:
+        nvidia.com/gpu.present: 'true'
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: s5cmd-prefetch
+        image: peakcom/s5cmd:v2.3.0
+        command:
+        - /bin/sh
+        - -c
+        - set -eu; (mkdir -p /models/.locks /models/.staging && flock /models/.locks/$(basename
+          qwen--qwen2.5-7b-instruct).lock /bin/sh -c 'if [ ! -f /models/qwen--qwen2.5-7b-instruct/.ready
+          ]; then stage="/models/.staging/$(basename qwen--qwen2.5-7b-instruct).$$";
+          mkdir -p "$stage" && s5cmd cp --concurrency 32 "s3://llm-model-weights/Qwen/Qwen2.5-7B-Instruct/*"
+          "$stage/" && touch "$stage/.ready" && mkdir -p "$(dirname /models/qwen--qwen2.5-7b-instruct)"
+          && mv "$stage" "/models/qwen--qwen2.5-7b-instruct"; fi') && (mkdir -p /models/.locks
+          /models/.staging && flock /models/.locks/$(basename qwen--qwen2.5-7b-instruct-awq).lock
+          /bin/sh -c 'if [ ! -f /models/qwen--qwen2.5-7b-instruct-awq/.ready ]; then
+          stage="/models/.staging/$(basename qwen--qwen2.5-7b-instruct-awq).$$"; mkdir
+          -p "$stage" && s5cmd cp --concurrency 32 "s3://llm-model-weights/Qwen/Qwen2.5-7B-Instruct-AWQ/*"
+          "$stage/" && touch "$stage/.ready" && mkdir -p "$(dirname /models/qwen--qwen2.5-7b-instruct-awq)"
+          && mv "$stage" "/models/qwen--qwen2.5-7b-instruct-awq"; fi') && (mkdir -p
+          /models/.locks /models/.staging && flock /models/.locks/$(basename qwen--qwen2.5-1.5b-instruct).lock
+          /bin/sh -c 'if [ ! -f /models/qwen--qwen2.5-1.5b-instruct/.ready ]; then
+          stage="/models/.staging/$(basename qwen--qwen2.5-1.5b-instruct).$$"; mkdir
+          -p "$stage" && s5cmd cp --concurrency 32 "s3://llm-model-weights/Qwen/Qwen2.5-1.5B-Instruct/*"
+          "$stage/" && touch "$stage/.ready" && mkdir -p "$(dirname /models/qwen--qwen2.5-1.5b-instruct)"
+          && mv "$stage" "/models/qwen--qwen2.5-1.5b-instruct"; fi'); exec sleep infinity
+        volumeMounts:
+        - name: model-cache
+          mountPath: /models
+      volumes:
+      - name: model-cache
+        hostPath:
+          path: /mnt/nvme/models
+          type: DirectoryOrCreate

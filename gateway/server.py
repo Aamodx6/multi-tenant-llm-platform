@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import redis
@@ -9,7 +10,7 @@ from starlette.applications import Starlette
 
 from catalog.pool_catalog import ModelPoolCatalog, load_and_validate
 from gateway.pool_health import PoolHealth, PoolHealthStore, RedisPoolHealthAdapter
-from gateway.request_control import ReplicaEndpoint, VLLMAdapter, create_app
+from gateway.request_control import ReplicaEndpoint, UsageEvent, VLLMAdapter, create_app
 from gateway.tenant_budget import (
     BudgetAdapter,
     InMemoryBudgetAdapter,
@@ -19,6 +20,7 @@ from gateway.tenant_budget import (
     TenantRecord,
     hash_api_key,
 )
+from gateway.usage_rollup import RedisStreamUsageSink
 from observability.metrics import MetricsRegistry
 
 
@@ -73,6 +75,7 @@ def create_default_app() -> Starlette:
     redis_url = os.environ.get("REDIS_URL")
     budget_adapter: BudgetAdapter
     pool_health: PoolHealth
+    on_usage: Callable[[UsageEvent], None] | None = None
     if redis_url:
         client = redis.Redis.from_url(redis_url, decode_responses=True)
         budget_adapter = RedisPostgresAdapter(
@@ -81,9 +84,13 @@ def create_default_app() -> Starlette:
             gateway_replicas=int(os.environ.get("GATEWAY_REPLICAS", "1")),
         )
         pool_health = RedisPoolHealthAdapter(redis_client=client)
+        on_usage = RedisStreamUsageSink(redis_client=client).emit
     else:
         budget_adapter = InMemoryBudgetAdapter(keys_by_hash)
         pool_health = PoolHealthStore()
+
+    raw_salt_secret = os.environ.get("CACHE_SALT_SECRET")
+    cache_salt_secret = raw_salt_secret.encode("utf-8") if raw_salt_secret else None
 
     poll_interval = float(os.environ.get("METRICS_POLL_INTERVAL_SECONDS", "5.0"))
     return create_app(
@@ -93,6 +100,8 @@ def create_default_app() -> Starlette:
         engine=VLLMAdapter(replicas=_load_replicas(catalog)),
         metrics=MetricsRegistry(),
         metrics_poll_interval_seconds=poll_interval if poll_interval > 0 else None,
+        on_usage=on_usage,
+        cache_salt_secret=cache_salt_secret,
     )
 
 

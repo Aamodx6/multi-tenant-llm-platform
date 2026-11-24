@@ -6,7 +6,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
-from catalog.pool_catalog import IsolationMode, ModelPoolCatalog, ModelPoolSpec
+from catalog.pool_catalog import IsolationMode, ModelPoolCatalog, ModelPoolSpec, model_slug
 
 
 class DeployConfig(BaseModel):
@@ -15,7 +15,11 @@ class DeployConfig(BaseModel):
     namespace: str = "llm"
     prometheus_url: str = "http://prometheus-operated.monitoring:9090"
     request_control_image: str = "ghcr.io/multi-tenant-llm/request-control:latest"
-    vllm_image: str = "vllm/vllm-openai:v0.7.3"
+    vllm_image: str = "vllm/vllm-openai:v0.9.0"
+    s5cmd_image: str = "peakcom/s5cmd:v2.3.0"
+    model_bucket_name: str = "llm-model-weights"
+    prefetch_service_account: str = "weight-prefetcher"
+    use_prefetched_weights: bool = False
     cluster_name: str = "llm-prod-eks"
     spot_instance_families: list[str] = Field(default_factory=lambda: ["g6", "g5"])
 
@@ -30,10 +34,11 @@ def render_deploy_manifests(
     vllm_args_map: dict[str, list[str]] = targets["vllm_args"]
     keda_map: dict[str, dict[str, Any]] = targets["keda_triggers"]
     slo_map: dict[str, dict[str, Any]] = targets["rollout_slos"]
+    prefetch_map: dict[str, dict[str, Any]] = targets["prefetch_targets"]
 
     out: dict[str, str] = {}
     for name, spec in catalog.pools.items():
-        args = vllm_args_map.get(name, [])
+        args = list(vllm_args_map.get(name, []))
         keda_cfg = keda_map[name]
         out[f"deployment-{name}.yaml"] = yaml.safe_dump(
             _vllm_deployment(name, spec, args, cfg), sort_keys=False
@@ -43,6 +48,10 @@ def render_deploy_manifests(
         )
         if spec.isolation == IsolationMode.SHARED:
             out[f"pdb-{name}.yaml"] = yaml.safe_dump(_pool_pdb(name, cfg), sort_keys=False)
+
+    out["daemonset-weight-prefetch.yaml"] = yaml.safe_dump(
+        _weight_prefetch_daemonset(prefetch_map, cfg), sort_keys=False
+    )
 
     out["networkpolicy-inference.yaml"] = yaml.safe_dump(
         _inference_network_policy(cfg), sort_keys=False
@@ -76,6 +85,86 @@ def _vllm_deployment(
     vllm_args: list[str],
     cfg: DeployConfig,
 ) -> dict[str, Any]:
+    effective_args = list(vllm_args)
+    slug = model_slug(spec.model_id)
+    init_containers: list[dict[str, Any]] = []
+    if cfg.use_prefetched_weights:
+        if "--model" in effective_args:
+            idx = effective_args.index("--model")
+            if idx + 1 < len(effective_args):
+                effective_args[idx + 1] = f"/models/{slug}"
+        ready_checks = [f"/models/{slug}/.ready"]
+        ready_checks.extend(
+            f"/models/loras/{name}/{lora.name}/.ready"
+            for lora in spec.loras
+            if not lora.dynamic
+        )
+        cond = " && ".join(f"[ -f {path} ]" for path in ready_checks)
+        init_containers.append(
+            {
+                "name": "wait-model-weights",
+                "image": "busybox:1.36",
+                "command": ["/bin/sh", "-c", f"until {cond}; do sleep 2; done"],
+                "volumeMounts": [{"name": "model-cache", "mountPath": "/models"}],
+            }
+        )
+
+    env_vars: list[dict[str, str]] = []
+    if spec.enable_lora and any(lora.dynamic for lora in spec.loras):
+        env_vars.append({"name": "VLLM_ALLOW_RUNTIME_LORA_UPDATING", "value": "true"})
+
+    container: dict[str, Any] = {
+        "name": "vllm",
+        "image": cfg.vllm_image,
+        "args": effective_args,
+        "ports": [{"containerPort": 8000, "name": "http"}],
+        "resources": {
+            "limits": {"nvidia.com/gpu": 1},
+            "requests": {"nvidia.com/gpu": 1, "memory": "16Gi", "cpu": "4"},
+        },
+        "volumeMounts": [
+            {"name": "dshm", "mountPath": "/dev/shm"},
+            {"name": "model-cache", "mountPath": "/models"},
+        ],
+        "startupProbe": {
+            "httpGet": {"path": "/health", "port": 8000},
+            "periodSeconds": 5,
+            "failureThreshold": 60,
+        },
+        "readinessProbe": {
+            "httpGet": {"path": "/v1/models", "port": 8000},
+            "periodSeconds": 10,
+            "timeoutSeconds": 3,
+        },
+        "lifecycle": {
+            "preStop": {"exec": {"command": ["/bin/sh", "-c", "sleep 15"]}}
+        },
+    }
+    if env_vars:
+        container["env"] = env_vars
+
+    pod_spec: dict[str, Any] = {
+        "terminationGracePeriodSeconds": 180,
+        "nodeSelector": {"nvidia.com/gpu.present": "true"},
+        "tolerations": [
+            {
+                "key": "nvidia.com/gpu",
+                "operator": "Exists",
+                "effect": "NoSchedule",
+            }
+        ],
+        "containers": [container],
+        "volumes": [
+            {"name": "dshm", "emptyDir": {"medium": "Memory", "sizeLimit": "4Gi"}},
+            {
+                "name": "model-cache",
+                "hostPath": {"path": "/mnt/nvme/models", "type": "DirectoryOrCreate"},
+            },
+        ],
+    }
+    if init_containers:
+        pod_spec["initContainers"] = init_containers
+
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -89,55 +178,7 @@ def _vllm_deployment(
             "selector": {"matchLabels": {"app": "vllm", "pool": name}},
             "template": {
                 "metadata": {"labels": {"app": "vllm", "pool": name}},
-                "spec": {
-                    "terminationGracePeriodSeconds": 180,
-                    "nodeSelector": {"nvidia.com/gpu.present": "true"},
-                    "tolerations": [
-                        {
-                            "key": "nvidia.com/gpu",
-                            "operator": "Exists",
-                            "effect": "NoSchedule",
-                        }
-                    ],
-                    "containers": [
-                        {
-                            "name": "vllm",
-                            "image": cfg.vllm_image,
-                            "args": vllm_args,
-                            "ports": [{"containerPort": 8000, "name": "http"}],
-                            "resources": {
-                                "limits": {"nvidia.com/gpu": 1},
-                                "requests": {"nvidia.com/gpu": 1, "memory": "16Gi", "cpu": "4"},
-                            },
-                            "volumeMounts": [
-                                {"name": "dshm", "mountPath": "/dev/shm"},
-                                {"name": "model-cache", "mountPath": "/models"},
-                            ],
-                            "startupProbe": {
-                                "httpGet": {"path": "/health", "port": 8000},
-                                "periodSeconds": 5,
-                                "failureThreshold": 60,
-                            },
-                            "readinessProbe": {
-                                "httpGet": {"path": "/v1/models", "port": 8000},
-                                "periodSeconds": 10,
-                                "timeoutSeconds": 3,
-                            },
-                            "lifecycle": {
-                                "preStop": {
-                                    "exec": {"command": ["/bin/sh", "-c", "sleep 15"]}
-                                }
-                            },
-                        }
-                    ],
-                    "volumes": [
-                        {"name": "dshm", "emptyDir": {"medium": "Memory", "sizeLimit": "4Gi"}},
-                        {
-                            "name": "model-cache",
-                            "hostPath": {"path": "/mnt/nvme/models", "type": "DirectoryOrCreate"},
-                        },
-                    ],
-                },
+                "spec": pod_spec,
             },
         },
     }
@@ -270,6 +311,7 @@ def _karpenter_nodeclass(cfg: DeployConfig) -> dict[str, Any]:
         "spec": {
             "amiSelectorTerms": [{"alias": "al2023@latest"}],
             "role": f"{cfg.cluster_name}-karpenter-node",
+            "instanceStorePolicy": "RAID0",
             "subnetSelectorTerms": [{"tags": {"karpenter.sh/discovery": cfg.cluster_name}}],
             "securityGroupSelectorTerms": [{"tags": {"karpenter.sh/discovery": cfg.cluster_name}}],
             "blockDeviceMappings": [
@@ -282,6 +324,87 @@ def _karpenter_nodeclass(cfg: DeployConfig) -> dict[str, Any]:
                     },
                 }
             ],
+        },
+    }
+
+
+def _normalize_s3_uri(uri: str, bucket_name: str) -> str:
+    trimmed = uri.rstrip("/")
+    if trimmed.startswith("s3://models/"):
+        return f"s3://{bucket_name}/{trimmed[len('s3://models/'):]}"
+    return trimmed
+
+
+def _weight_prefetch_daemonset(
+    prefetch_targets: dict[str, dict[str, Any]],
+    cfg: DeployConfig,
+) -> dict[str, Any]:
+    sync_entries: list[tuple[str, str]] = []
+    for pool_name, entry in prefetch_targets.items():
+        slug = str(entry["slug"])
+        uri = _normalize_s3_uri(str(entry["prefetch_uri"]), cfg.model_bucket_name)
+        sync_entries.append((slug, uri))
+        for lora in entry.get("loras", []):
+            sync_entries.append(
+                (
+                    f"loras/{pool_name}/{lora['name']}",
+                    _normalize_s3_uri(str(lora["s3_uri"]), cfg.model_bucket_name),
+                )
+            )
+
+    sync_commands = " && ".join(
+        (
+            f"(mkdir -p /models/.locks /models/.staging && "
+            f"flock /models/.locks/$(basename {rel}).lock /bin/sh -c '"
+            f"if [ ! -f /models/{rel}/.ready ]; then "
+            f'stage="/models/.staging/$(basename {rel}).$$"; '
+            f'mkdir -p "$stage" && '
+            f's5cmd cp --concurrency 32 "{uri}/*" "$stage/" && '
+            f'touch "$stage/.ready" && '
+            f'mkdir -p "$(dirname /models/{rel})" && '
+            f'mv "$stage" "/models/{rel}"; fi\')'
+        )
+        for rel, uri in sync_entries
+    )
+    script = f"set -eu; {sync_commands or 'true'}; exec sleep infinity"
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "DaemonSet",
+        "metadata": {
+            "name": "weight-prefetch",
+            "namespace": cfg.namespace,
+            "labels": {"app": "weight-prefetch"},
+        },
+        "spec": {
+            "selector": {"matchLabels": {"app": "weight-prefetch"}},
+            "template": {
+                "metadata": {"labels": {"app": "weight-prefetch"}},
+                "spec": {
+                    "serviceAccountName": cfg.prefetch_service_account,
+                    "nodeSelector": {"nvidia.com/gpu.present": "true"},
+                    "tolerations": [
+                        {
+                            "key": "nvidia.com/gpu",
+                            "operator": "Exists",
+                            "effect": "NoSchedule",
+                        }
+                    ],
+                    "containers": [
+                        {
+                            "name": "s5cmd-prefetch",
+                            "image": cfg.s5cmd_image,
+                            "command": ["/bin/sh", "-c", script],
+                            "volumeMounts": [{"name": "model-cache", "mountPath": "/models"}],
+                        }
+                    ],
+                    "volumes": [
+                        {
+                            "name": "model-cache",
+                            "hostPath": {"path": "/mnt/nvme/models", "type": "DirectoryOrCreate"},
+                        }
+                    ],
+                },
+            },
         },
     }
 

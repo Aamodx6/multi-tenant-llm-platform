@@ -685,3 +685,255 @@ async def test_vllm_adapter_parses_sse_usage_aborts_by_closing_stream_and_scrape
     assert gw_chunks[0]["choices"][0]["delta"]["role"] == "assistant"
     assert gw_chunks[-2]["choices"][0]["finish_reason"] == "stop"
     assert gw_chunks[-1]["usage"]["total_tokens"] == 6
+
+
+@pytest.mark.anyio
+async def test_dynamic_lora_enforces_tenant_ownership_blocks_incompatible_fallback_and_loads() -> (
+    None
+):
+    lora_catalog_yaml = """
+pools:
+  pool-8b:
+    model_id: Qwen/Qwen2.5-7B-Instruct
+    fallback_pool: pool-fallback
+    enable_lora: true
+    max_loras: 4
+    max_lora_rank: 16
+    max_cpu_loras: 8
+    min_replicas: 1
+    max_replicas: 4
+    keda_waiting_threshold: 4
+    keda_kv_cache_threshold: 0.80
+    slo_p95_ttft_ms: 1000
+    slo_availability: 0.995
+    loras:
+      - name: tenant-a-sql
+        tenant_id: tenant-a
+        s3_uri: s3://models/loras/tenant-a-sql
+        rank: 16
+        dynamic: true
+  pool-fallback:
+    model_id: Qwen/Qwen2.5-1.5B-Instruct
+    isolation: fallback
+    min_replicas: 0
+    max_replicas: 2
+    keda_waiting_threshold: 6
+    keda_kv_cache_threshold: 0.85
+    slo_p95_ttft_ms: 600
+    slo_availability: 0.99
+"""
+    catalog = load_and_validate(lora_catalog_yaml)
+    ta = TenantRecord("tenant-a", PriorityClass.PAID, tpm_limit=100, max_concurrency=1)
+    tb = TenantRecord("tenant-b", PriorityClass.PAID, tpm_limit=100, max_concurrency=1)
+    health = PoolHealthStore()
+    engine = FakeEngineAdapter(
+        replicas={
+            "pool-8b": [ReplicaEndpoint("8b-0", "http://8b-0:8000")],
+            "pool-fallback": [ReplicaEndpoint("fb-0", "http://fb-0:8000")],
+        },
+        completion_tokens=5,
+    )
+    app = create_app(
+        catalog=catalog,
+        budget=TenantBudget(
+            adapter=InMemoryBudgetAdapter(
+                {hash_api_key("sk-a"): ta, hash_api_key("sk-b"): tb}
+            )
+        ),
+        pool_health=health,
+        engine=engine,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        # Tenant B cannot access Tenant A's private LoRA (returns 404 and refunds budget)
+        denied = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-b"},
+            json={
+                "model": "tenant-a-sql",
+                "max_tokens": 80,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert denied.status_code == 404
+
+        # Tenant B's budget was NOT consumed by denied call
+        b_base = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-b"},
+            json={
+                "model": "pool-8b",
+                "max_tokens": 80,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert b_base.status_code == 200
+
+        # Tenant A invokes its LoRA cleanly
+        allowed = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-a"},
+            json={
+                "model": "tenant-a-sql",
+                "max_tokens": 20,
+                "messages": [{"role": "user", "content": "select *"}],
+            },
+        )
+        assert allowed.status_code == 200
+        assert allowed.json()["model"] == "tenant-a-sql"
+        assert engine.dispatched[-1][1] == "tenant-a-sql"
+
+        # When pool-8b is degraded, LoRA must NOT fall back to 1.5B pool-fallback -> 503
+        health.set_degraded("pool-8b", "kv_pressure", ttl_seconds=60.0)
+        no_fb = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-a"},
+            json={
+                "model": "tenant-a-sql",
+                "max_tokens": 20,
+                "messages": [{"role": "user", "content": "select *"}],
+            },
+        )
+        assert no_fb.status_code == 503
+
+    # VLLMAdapter loads dynamic LoRA via /v1/load_lora_adapter once per (replica, lora)
+    load_calls: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/load_lora_adapter":
+            load_calls.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"status": "loaded"})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+            },
+        )
+
+    rep = ReplicaEndpoint("8b-0", "http://vllm-0:8000")
+    vllm = VLLMAdapter(
+        replicas={"pool-8b": [rep]},
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    await vllm.ensure_lora_loaded(
+        replica=rep,
+        lora_name="tenant-a-sql",
+        lora_path="/models/loras/pool-8b/tenant-a-sql",
+    )
+    await vllm.ensure_lora_loaded(
+        replica=rep,
+        lora_name="tenant-a-sql",
+        lora_path="/models/loras/pool-8b/tenant-a-sql",
+    )
+    assert load_calls == [
+        {
+            "lora_name": "tenant-a-sql",
+            "lora_path": "/models/loras/pool-8b/tenant-a-sql",
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_prefix_cache_salt_isolates_tenants_and_strips_spoofed_salt() -> None:
+    catalog = load_and_validate(
+        """
+pools:
+  pool-shared:
+    model_id: Qwen/Qwen2.5-7B-Instruct
+    isolation: shared
+    isolate_prefix_cache: true
+    min_replicas: 1
+    max_replicas: 2
+    keda_waiting_threshold: 4
+    keda_kv_cache_threshold: 0.80
+    slo_p95_ttft_ms: 1000
+    slo_availability: 0.995
+  pool-optout:
+    model_id: Qwen/Qwen2.5-1.5B-Instruct
+    isolation: dedicated
+    isolate_prefix_cache: false
+    min_replicas: 1
+    max_replicas: 2
+    keda_waiting_threshold: 4
+    keda_kv_cache_threshold: 0.80
+    slo_p95_ttft_ms: 1000
+    slo_availability: 0.995
+"""
+    )
+    seen_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_payloads.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+            },
+        )
+
+    vllm = VLLMAdapter(
+        replicas={
+            "pool-shared": [ReplicaEndpoint("shared-0", "http://shared-0:8000")],
+            "pool-optout": [ReplicaEndpoint("opt-0", "http://opt-0:8000")],
+        },
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    app = create_app(
+        catalog=catalog,
+        budget=TenantBudget(
+            adapter=InMemoryBudgetAdapter(
+                {
+                    hash_api_key("sk-a"): TenantRecord("tenant-a", PriorityClass.PAID, 10_000),
+                    hash_api_key("sk-b"): TenantRecord("tenant-b", PriorityClass.PAID, 10_000),
+                }
+            )
+        ),
+        pool_health=PoolHealthStore(),
+        engine=vllm,
+        cache_salt_secret=b"unit-test-secret",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r_a = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-a"},
+            json={
+                "model": "pool-shared",
+                "cache_salt": "attacker-forged-salt",
+                "messages": [{"role": "system", "content": "shared system prefix"}],
+            },
+        )
+        r_b = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-b"},
+            json={
+                "model": "pool-shared",
+                "cache_salt": "attacker-forged-salt",
+                "messages": [{"role": "system", "content": "shared system prefix"}],
+            },
+        )
+        r_opt = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-a"},
+            json={
+                "model": "pool-optout",
+                "cache_salt": "attacker-forged-salt",
+                "messages": [{"role": "system", "content": "shared system prefix"}],
+            },
+        )
+        assert r_a.status_code == 200 and r_b.status_code == 200 and r_opt.status_code == 200
+
+    assert len(seen_payloads) == 3
+    salt_a = seen_payloads[0]["cache_salt"]
+    salt_b = seen_payloads[1]["cache_salt"]
+    assert isinstance(salt_a, str) and len(salt_a) == 64
+    assert salt_a != "attacker-forged-salt"
+    assert salt_b != "attacker-forged-salt"
+    assert salt_a != salt_b
+    assert "cache_salt" not in seen_payloads[2]

@@ -41,6 +41,7 @@ spec:
   amiSelectorTerms:
   - alias: al2023@latest
   role: llm-prod-eks-karpenter-node
+  instanceStorePolicy: RAID0
   subnetSelectorTerms:
   - tags:
       karpenter.sh/discovery: llm-prod-eks

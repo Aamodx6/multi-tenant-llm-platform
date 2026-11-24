@@ -82,6 +82,44 @@ def test_render_deploy_manifests_wires_keda_deployments_karpenter_rollouts_and_n
     karpenter_docs = list(yaml.safe_load_all(manifests["karpenter-gpu.yaml"]))
     assert karpenter_docs[0]["kind"] == "NodePool"
     assert karpenter_docs[1]["kind"] == "EC2NodeClass"
+    assert _vllm_image_semver(manifests["deployment-pool-8b.yaml"]) >= (0, 9, 0)
+
+
+def _vllm_image_semver(manifest_yaml: str) -> tuple[int, ...]:
+    dep = yaml.safe_load(manifest_yaml)
+    image: str = dep["spec"]["template"]["spec"]["containers"][0]["image"]
+    tag = image.split(":")[-1].lstrip("v")
+    return tuple(int(part) for part in tag.split(".")[:3])
+
+
+def test_dynamic_lora_deployment_sets_runtime_updating_env() -> None:
+    lora_yaml = """
+pools:
+  pool-8b:
+    model_id: Qwen/Qwen2.5-7B-Instruct
+    enable_lora: true
+    max_loras: 4
+    max_lora_rank: 16
+    max_cpu_loras: 8
+    min_replicas: 1
+    max_replicas: 4
+    keda_waiting_threshold: 4
+    keda_kv_cache_threshold: 0.80
+    slo_p95_ttft_ms: 1000
+    slo_availability: 0.995
+    loras:
+      - name: tenant-a-sql
+        tenant_id: tenant-a
+        s3_uri: s3://models/loras/tenant-a-sql
+        rank: 16
+        dynamic: true
+"""
+    cat = load_and_validate(lora_yaml)
+    manifests = render_deploy_manifests(cat)
+    dep = yaml.safe_load(manifests["deployment-pool-8b.yaml"])
+    container = dep["spec"]["template"]["spec"]["containers"][0]
+    assert "--enable-lora" in container["args"]
+    assert {"name": "VLLM_ALLOW_RUNTIME_LORA_UPDATING", "value": "true"} in container["env"]
 
 
 @pytest.mark.anyio
@@ -97,3 +135,41 @@ async def test_default_catalog_and_server_app_expose_metrics() -> None:
         resp = await client.get("/metrics")
         assert resp.status_code == 200
         assert "gateway_requests_total" in resp.text
+
+
+def test_prefetch_daemonset_wait_init_container_and_karpenter_raid0() -> None:
+    catalog = load_and_validate(CATALOG_YAML)
+    manifests = render_deploy_manifests(
+        catalog,
+        DeployConfig(
+            namespace="llm-prod",
+            use_prefetched_weights=True,
+            model_bucket_name="custom-weights-bucket",
+        ),
+    )
+    assert "daemonset-weight-prefetch.yaml" in manifests
+
+    ds = yaml.safe_load(manifests["daemonset-weight-prefetch.yaml"])
+    assert ds["kind"] == "DaemonSet"
+    ds_spec = ds["spec"]["template"]["spec"]
+    assert ds_spec["nodeSelector"] == {"nvidia.com/gpu.present": "true"}
+    assert any(t["key"] == "nvidia.com/gpu" for t in ds_spec["tolerations"])
+    ds_container = ds_spec["containers"][0]
+    assert "s5cmd" in " ".join(ds_container.get("command", []) + ds_container.get("args", []))
+    assert ".ready" in " ".join(ds_container.get("command", []) + ds_container.get("args", []))
+    assert ds_spec["volumes"][0]["hostPath"]["path"] == "/mnt/nvme/models"
+
+    dep_8b = yaml.safe_load(manifests["deployment-pool-8b.yaml"])
+    pod_spec = dep_8b["spec"]["template"]["spec"]
+    assert len(pod_spec["initContainers"]) == 1
+    assert pod_spec["initContainers"][0]["name"] == "wait-model-weights"
+    init_cmd = " ".join(pod_spec["initContainers"][0]["command"])
+    assert "/models/qwen--qwen2.5-7b-instruct-awq/.ready" in init_cmd
+    vllm_args = pod_spec["containers"][0]["args"]
+    model_idx = vllm_args.index("--model")
+    assert vllm_args[model_idx + 1] == "/models/qwen--qwen2.5-7b-instruct-awq"
+    served_idx = vllm_args.index("--served-model-name")
+    assert vllm_args[served_idx + 1] == "Qwen/Qwen2.5-7B-Instruct-AWQ"
+
+    karpenter_docs = list(yaml.safe_load_all(manifests["karpenter-gpu.yaml"]))
+    assert karpenter_docs[1]["spec"]["instanceStorePolicy"] == "RAID0"

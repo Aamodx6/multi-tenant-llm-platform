@@ -4,9 +4,11 @@ import asyncio
 import bisect
 import hashlib
 import heapq
+import hmac
 import json
 import math
 import re
+import secrets
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -119,6 +121,10 @@ class InferenceEngine(Protocol):
 
     async def abort(self, *, replica: ReplicaEndpoint, request_id: str) -> None: ...
 
+    async def ensure_lora_loaded(
+        self, *, replica: ReplicaEndpoint, lora_name: str, lora_path: str
+    ) -> None: ...
+
 
 class AdmissionPolicy(BaseModel):
     """In-process priority queue and load-shedding parameters."""
@@ -208,6 +214,7 @@ class FakeEngineAdapter:
         self.stream_gate = stream_gate
         self.dispatched: list[tuple[str, str, str]] = []
         self.aborted: list[tuple[str, str]] = []
+        self.loaded_loras: set[tuple[str, str]] = set()
 
     def list_replicas(self, pool: str) -> list[ReplicaEndpoint]:
         return list(self._replicas.get(pool, []))
@@ -260,6 +267,12 @@ class FakeEngineAdapter:
     async def abort(self, *, replica: ReplicaEndpoint, request_id: str) -> None:
         self.aborted.append((replica.replica_id, request_id))
 
+    async def ensure_lora_loaded(
+        self, *, replica: ReplicaEndpoint, lora_name: str, lora_path: str
+    ) -> None:
+        _ = lora_path
+        self.loaded_loras.add((replica.replica_id, lora_name))
+
 
 class VLLMAdapter:
     """Production InferenceEngine adapter calling vLLM OpenAI endpoints over HTTP."""
@@ -275,6 +288,26 @@ class VLLMAdapter:
             timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
         )
         self._active_streams: dict[str, httpx.Response] = {}
+        self._loaded_loras: set[tuple[str, str]] = set()
+        self._lora_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+    async def ensure_lora_loaded(
+        self, *, replica: ReplicaEndpoint, lora_name: str, lora_path: str
+    ) -> None:
+        """Load a dynamic LoRA adapter onto a vLLM replica once using singleflight locking."""
+        key = (replica.replica_id, lora_name)
+        if key in self._loaded_loras:
+            return
+        lock = self._lora_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if key in self._loaded_loras:
+                return
+            resp = await self._client.post(
+                f"{replica.url}/v1/load_lora_adapter",
+                json={"lora_name": lora_name, "lora_path": lora_path},
+            )
+            resp.raise_for_status()
+            self._loaded_loras.add(key)
 
     def list_replicas(self, pool: str) -> list[ReplicaEndpoint]:
         return list(self._replicas.get(pool, []))
@@ -458,6 +491,10 @@ class UsageEvent:
     tenant_id: str
     pool: str
     tokens: int
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    lora_name: str | None = None
+    recorded_at_ms: int = 0
 
 
 @dataclass
@@ -469,6 +506,7 @@ class _RuntimeDeps:
     admission: _PriorityAdmission
     metrics: MetricsRegistry | None = None
     on_usage: Callable[[UsageEvent], None] | None = None
+    cache_salt_secret: bytes = b""
 
 
 def _record_usage_and_reconcile(
@@ -478,6 +516,9 @@ def _record_usage_and_reconcile(
     pool_name: str,
     total_tokens: int,
     trace_id: str,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    lora_name: str | None = None,
 ) -> None:
     deps.budget.reconcile(permit, total_tokens)
     if deps.metrics is not None and total_tokens > 0:
@@ -491,6 +532,10 @@ def _record_usage_and_reconcile(
                 tenant_id=permit.tenant_id,
                 pool=pool_name,
                 tokens=total_tokens,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                lora_name=lora_name,
+                recorded_at_ms=int(time.time() * 1000),
             )
         )
 
@@ -517,6 +562,23 @@ def _record_status(deps: _RuntimeDeps, *, pool: str, priority: str, status: str)
         deps.metrics.requests_total.labels(pool=pool, priority=priority, status=status).inc()
 
 
+def _build_upstream_payload(
+    *,
+    req: ChatCompletionRequest,
+    pool: ModelPoolSpec,
+    tenant_id: str,
+    secret: bytes,
+) -> dict[str, Any]:
+    """Strip any caller-supplied cache_salt and derive an HMAC tenant salt when isolated."""
+    payload = req.model_dump()
+    payload.pop("cache_salt", None)
+    if pool.enable_prefix_caching and pool.isolate_prefix_cache:
+        payload["cache_salt"] = hmac.new(
+            secret, tenant_id.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+    return payload
+
+
 def create_app(
     *,
     catalog: ModelPoolCatalog,
@@ -527,6 +589,7 @@ def create_app(
     metrics: MetricsRegistry | None = None,
     metrics_poll_interval_seconds: float | None = None,
     on_usage: Callable[[UsageEvent], None] | None = None,
+    cache_salt_secret: bytes | None = None,
 ) -> Starlette:
     """Create the unified RequestControl ASGI application."""
     deps = _RuntimeDeps(
@@ -537,6 +600,7 @@ def create_app(
         admission=_PriorityAdmission(admission_policy or AdmissionPolicy()),
         metrics=metrics,
         on_usage=on_usage,
+        cache_salt_secret=cache_salt_secret or secrets.token_bytes(32),
     )
 
     @asynccontextmanager
@@ -579,7 +643,7 @@ def create_app(
             )
 
         try:
-            pool_spec = deps.catalog.resolve_alias(req.model)
+            resolved = deps.catalog.resolve_target(req.model)
         except KeyError as exc:
             return _error_response(
                 message=str(exc),
@@ -587,6 +651,8 @@ def create_app(
                 error_type="invalid_request_error",
                 code="model_not_found",
             )
+        pool_spec = resolved.pool
+        lora_spec = resolved.lora
 
         est_prompt = _estimate_prompt_tokens(req.messages)
         est_total = est_prompt + req.max_tokens
@@ -617,6 +683,22 @@ def create_app(
                 error_type="rate_limit_exceeded",
                 code="rate_limit_exceeded",
                 headers={"Retry-After": str(exc.retry_after_seconds)},
+            )
+
+        if (
+            lora_spec is not None
+            and lora_spec.tenant_id is not None
+            and permit.tenant_id != lora_spec.tenant_id
+        ):
+            deps.budget.reconcile(permit, 0)
+            _record_status(
+                deps, pool=pool_spec.name, priority=str(permit.priority), status="404"
+            )
+            return _error_response(
+                message=f"Unknown model alias or pool: {req.model}",
+                status_code=404,
+                error_type="invalid_request_error",
+                code="model_not_found",
             )
 
         t_queue = time.perf_counter()
@@ -650,6 +732,9 @@ def create_app(
             deps=deps,
             initial_pool=pool_spec,
             messages=req.messages,
+            allow_fallback=lora_spec is None,
+            lora_name=lora_spec.name if lora_spec is not None else None,
+            tenant_id=permit.tenant_id,
         )
         if replica is None:
             deps.admission.release()
@@ -668,6 +753,26 @@ def create_app(
                 from_pool=pool_spec.name, to_pool=target_pool.name
             ).inc()
 
+        served_model = lora_spec.name if lora_spec is not None else target_pool.model_id
+        if lora_spec is not None and lora_spec.dynamic:
+            try:
+                await deps.engine.ensure_lora_loaded(
+                    replica=replica,
+                    lora_name=lora_spec.name,
+                    lora_path=f"/models/loras/{target_pool.name}/{lora_spec.name}",
+                )
+            except BaseException:
+                deps.admission.release()
+                deps.budget.reconcile(permit, 0)
+                raise
+
+        upstream_payload = _build_upstream_payload(
+            req=req,
+            pool=target_pool,
+            tenant_id=permit.tenant_id,
+            secret=deps.cache_salt_secret,
+        )
+
         t_req = time.perf_counter()
         if req.stream:
             return _streaming_chat_response(
@@ -676,6 +781,9 @@ def create_app(
                 req=req,
                 permit=permit,
                 target_pool=target_pool,
+                served_model=served_model,
+                lora_name=lora_spec.name if lora_spec is not None else None,
+                upstream_payload=upstream_payload,
                 replica=replica,
                 est_prompt=est_prompt,
                 trace_id=trace_id,
@@ -685,9 +793,9 @@ def create_app(
         try:
             result = await deps.engine.complete(
                 replica=replica,
-                model_id=target_pool.model_id,
+                model_id=served_model,
                 request_id=trace_id,
-                payload=req.model_dump(),
+                payload=upstream_payload,
             )
         finally:
             deps.admission.release()
@@ -705,13 +813,16 @@ def create_app(
             pool_name=target_pool.name,
             total_tokens=total_tokens,
             trace_id=trace_id,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            lora_name=lora_spec.name if lora_spec is not None else None,
         )
         return JSONResponse(
             {
                 "id": f"chatcmpl-{trace_id}",
                 "object": "chat.completion",
                 "created": int(time.time()),
-                "model": target_pool.model_id,
+                "model": served_model,
                 "choices": [
                     {
                         "index": 0,
@@ -744,6 +855,9 @@ def _streaming_chat_response(
     req: ChatCompletionRequest,
     permit: Permit,
     target_pool: ModelPoolSpec,
+    served_model: str,
+    lora_name: str | None = None,
+    upstream_payload: dict[str, Any],
     replica: ReplicaEndpoint,
     est_prompt: int,
     trace_id: str,
@@ -761,9 +875,9 @@ def _streaming_chat_response(
         recorded_ttft = False
         stream_iter = deps.engine.stream(
             replica=replica,
-            model_id=target_pool.model_id,
+            model_id=served_model,
             request_id=trace_id,
-            payload=req.model_dump(),
+            payload=upstream_payload,
         )
         try:
             async for chunk in stream_iter:
@@ -794,7 +908,7 @@ def _streaming_chat_response(
                     "id": f"chatcmpl-{trace_id}",
                     "object": "chat.completion.chunk",
                     "created": created,
-                    "model": target_pool.model_id,
+                    "model": served_model,
                     "choices": [
                         {
                             "index": 0,
@@ -818,7 +932,7 @@ def _streaming_chat_response(
                         "id": f"chatcmpl-{trace_id}",
                         "object": "chat.completion.chunk",
                         "created": created,
-                        "model": target_pool.model_id,
+                        "model": served_model,
                         "choices": [],
                         "usage": {
                             "prompt_tokens": prompt_used,
@@ -846,6 +960,9 @@ def _streaming_chat_response(
                     pool_name=target_pool.name,
                     total_tokens=prompt_used + emitted_tokens,
                     trace_id=trace_id,
+                    prompt_tokens=prompt_used,
+                    completion_tokens=emitted_tokens,
+                    lora_name=lora_name,
                 )
                 deps.admission.release()
 
@@ -917,8 +1034,12 @@ def _select_pool_and_replica(
     deps: _RuntimeDeps,
     initial_pool: ModelPoolSpec,
     messages: list[ChatMessage],
+    allow_fallback: bool = True,
+    lora_name: str | None = None,
+    tenant_id: str = "",
 ) -> tuple[ModelPoolSpec, ReplicaEndpoint | None]:
     prefix = _extract_prefix(messages)
+    base_key = f"lora:{lora_name}:{prefix}" if lora_name is not None else prefix
     curr: ModelPoolSpec | None = initial_pool
     seen: set[str] = set()
     while curr is not None and curr.name not in seen:
@@ -926,6 +1047,11 @@ def _select_pool_and_replica(
         status = deps.pool_health.get_state(curr.name)
         replicas = deps.engine.list_replicas(curr.name)
         if status.state == HealthState.HEALTHY and replicas:
-            return curr, _pick_replica(curr, replicas, prefix)
+            routing_key = (
+                f"{tenant_id}:{base_key}" if curr.isolate_prefix_cache and tenant_id else base_key
+            )
+            return curr, _pick_replica(curr, replicas, routing_key)
+        if not allow_fallback:
+            break
         curr = deps.catalog.pools.get(curr.fallback_pool) if curr.fallback_pool else None
     return initial_pool, None

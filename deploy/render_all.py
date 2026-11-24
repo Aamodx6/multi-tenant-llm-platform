@@ -14,10 +14,17 @@ def main() -> int:
     parser.add_argument("--catalog", type=Path, default=Path("catalog/pools.yaml"))
     parser.add_argument("--out-dir", type=Path, default=Path("deploy/generated"))
     parser.add_argument("--namespace", default="llm")
+    parser.add_argument("--use-prefetched-weights", action="store_true")
     args = parser.parse_args()
 
     catalog = load_and_validate(args.catalog.read_text(encoding="utf-8"))
-    manifests = render_deploy_manifests(catalog, DeployConfig(namespace=args.namespace))
+    manifests = render_deploy_manifests(
+        catalog,
+        DeployConfig(
+            namespace=args.namespace,
+            use_prefetched_weights=args.use_prefetched_weights,
+        ),
+    )
     obs = render_observability_bundle(catalog)
     write_manifests({**manifests, **obs}, args.out_dir)
     print(f"Wrote {len(manifests) + len(obs)} files to {args.out_dir}")

@@ -40,6 +40,24 @@ _Avoid_: Gateway-router split, proxy layer
 The operational state (`healthy`, `degraded`, or `unhealthy`) of a model pool used to drive fallback routing without mutating deployment manifests.
 _Avoid_: Circuit breaker state, readiness flag
 
+**LoRA Adapter**:
+A tenant-owned or shared low-rank weight delta served dynamically over a compatible base model pool (`--enable-lora`) and authorized per tenant before queue admission.
+_Avoid_: Fine-tuned model, plugin, sidecar weights
+
+**Cache Salt**:
+A gateway-derived cryptographic per-tenant token injected into vLLM's first KV-block hash (`cache_salt`) to isolate automatic prefix cache namespaces against cross-tenant timing side channels.
+_Avoid_: Cache key, API key hash, session ID
+
+### Metering & Delivery
+
+**Usage Event**:
+An immutable post-completion or post-abort token accounting record (`trace_id`, `tenant_id`, `pool`, `prompt_tokens`, `completion_tokens`, optional `lora_name`) appended to Redis Streams for idempotent hourly Postgres rollups.
+_Avoid_: Metric sample, invoice line, log entry
+
+**Weight Prefetch DaemonSet**:
+A GPU-node Kubernetes `DaemonSet` that syncs model and LoRA weights from S3 to local RAID0 NVMe (`hostPath`) via `s5cmd` with atomic `.ready` publication before inference pods start.
+_Avoid_: Model downloader job, sidecar cache
+
 ### Self-Healing & Configuration
 
 **Telemetry Window**:
