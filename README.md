@@ -4,7 +4,7 @@ Kubernetes-native multi-tenant LLM serving platform with unified request control
 
 ## Architecture & Key Docs
 
-- **Blueprint:** [docs/Multi-Tenant LLM Serving Platform Architecture.md](docs/Multi-Tenant%20LLM%20Serving%20Platform%20Architecture.md)
+- **Architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ([Excalidraw diagram](docs/architecture.excalidraw))
 - **Domain Glossary:** [GLOSSARY.md](GLOSSARY.md)
 - **ADRs:** [docs/adr/](docs/adr/)
 - **Research & Timed GPU Runbook:** [docs/research/end-to-end-gpu-execution-plan.md](docs/research/end-to-end-gpu-execution-plan.md)
