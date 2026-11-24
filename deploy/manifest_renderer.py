@@ -28,15 +28,18 @@ def render_deploy_manifests(
     cfg = config or DeployConfig()
     targets = catalog.render_targets()
     vllm_args_map: dict[str, list[str]] = targets["vllm_args"]
+    keda_map: dict[str, dict[str, Any]] = targets["keda_triggers"]
+    slo_map: dict[str, dict[str, Any]] = targets["rollout_slos"]
 
     out: dict[str, str] = {}
     for name, spec in catalog.pools.items():
         args = vllm_args_map.get(name, [])
+        keda_cfg = keda_map[name]
         out[f"deployment-{name}.yaml"] = yaml.safe_dump(
             _vllm_deployment(name, spec, args, cfg), sort_keys=False
         )
         out[f"keda-{name}.yaml"] = yaml.safe_dump(
-            _keda_scaled_object(name, spec, cfg), sort_keys=False
+            _keda_scaled_object(name, spec.model_id, keda_cfg, cfg), sort_keys=False
         )
         if spec.isolation == IsolationMode.SHARED:
             out[f"pdb-{name}.yaml"] = yaml.safe_dump(_pool_pdb(name, cfg), sort_keys=False)
@@ -47,8 +50,15 @@ def render_deploy_manifests(
     out["karpenter-gpu.yaml"] = yaml.safe_dump_all(
         [_karpenter_nodepool(cfg), _karpenter_nodeclass(cfg)], sort_keys=False
     )
+    ttft_slo_seconds = min(float(v["p95_ttft_ms"]) for v in slo_map.values()) / 1000.0
     out["rollout-request-control.yaml"] = yaml.safe_dump_all(
-        [_request_control_rollout(cfg), _ttft_analysis_template(cfg)], sort_keys=False
+        [
+            _request_control_service("request-control-stable", cfg),
+            _request_control_service("request-control-canary", cfg),
+            _request_control_rollout(cfg),
+            _ttft_analysis_template(ttft_slo_seconds, cfg),
+        ],
+        sort_keys=False,
     )
     return out
 
@@ -135,16 +145,17 @@ def _vllm_deployment(
 
 def _keda_scaled_object(
     name: str,
-    spec: ModelPoolSpec,
+    model_id: str,
+    keda_cfg: dict[str, Any],
     cfg: DeployConfig,
 ) -> dict[str, Any]:
     waiting_meta: dict[str, str] = {
         "serverAddress": cfg.prometheus_url,
         "metricName": "vllm_requests_waiting",
-        "query": f'sum(vllm:num_requests_waiting{{model_name="{spec.model_id}"}})',
-        "threshold": str(spec.keda_waiting_threshold),
+        "query": f'sum(vllm:num_requests_waiting{{model_name="{model_id}"}})',
+        "threshold": str(keda_cfg["waiting_threshold"]),
     }
-    if spec.min_replicas == 0:
+    if int(keda_cfg["min_replicas"]) == 0:
         waiting_meta["activationThreshold"] = "1"
 
     return {
@@ -155,8 +166,8 @@ def _keda_scaled_object(
             "scaleTargetRef": {"name": f"vllm-{name}"},
             "pollingInterval": 15,
             "cooldownPeriod": 300,
-            "minReplicaCount": spec.min_replicas,
-            "maxReplicaCount": spec.max_replicas,
+            "minReplicaCount": int(keda_cfg["min_replicas"]),
+            "maxReplicaCount": int(keda_cfg["max_replicas"]),
             "triggers": [
                 {"type": "prometheus", "metadata": waiting_meta},
                 {
@@ -164,8 +175,8 @@ def _keda_scaled_object(
                     "metadata": {
                         "serverAddress": cfg.prometheus_url,
                         "metricName": "vllm_kv_cache_usage",
-                        "query": f'avg(vllm:kv_cache_usage_perc{{model_name="{spec.model_id}"}})',
-                        "threshold": f"{spec.keda_kv_cache_threshold:.2f}",
+                        "query": f'avg(vllm:kv_cache_usage_perc{{model_name="{model_id}"}})',
+                        "threshold": f"{float(keda_cfg['kv_cache_threshold']):.2f}",
                     },
                 },
             ],
@@ -204,7 +215,8 @@ def _inference_network_policy(cfg: DeployConfig) -> dict[str, Any]:
                 },
             ],
             "egress": [
-                {"ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 443}]}
+                {"ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]},
+                {"to": [{"ipBlock": {"cidr": "10.0.0.0/8"}}]},
             ],
         },
     }
@@ -274,6 +286,18 @@ def _karpenter_nodeclass(cfg: DeployConfig) -> dict[str, Any]:
     }
 
 
+def _request_control_service(service_name: str, cfg: DeployConfig) -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": service_name, "namespace": cfg.namespace},
+        "spec": {
+            "selector": {"app": "request-control"},
+            "ports": [{"name": "http", "port": 8080, "targetPort": 8080}],
+        },
+    }
+
+
 def _request_control_rollout(cfg: DeployConfig) -> dict[str, Any]:
     return {
         "apiVersion": "argoproj.io/v1alpha1",
@@ -284,6 +308,8 @@ def _request_control_rollout(cfg: DeployConfig) -> dict[str, Any]:
             "selector": {"matchLabels": {"app": "request-control"}},
             "strategy": {
                 "canary": {
+                    "canaryService": "request-control-canary",
+                    "stableService": "request-control-stable",
                     "steps": [
                         {"setWeight": 5},
                         {"pause": {"duration": "2m"}},
@@ -294,7 +320,7 @@ def _request_control_rollout(cfg: DeployConfig) -> dict[str, Any]:
                             }
                         },
                         {"setWeight": 100},
-                    ]
+                    ],
                 }
             },
             "template": {
@@ -319,7 +345,7 @@ def _request_control_rollout(cfg: DeployConfig) -> dict[str, Any]:
     }
 
 
-def _ttft_analysis_template(cfg: DeployConfig) -> dict[str, Any]:
+def _ttft_analysis_template(ttft_slo_seconds: float, cfg: DeployConfig) -> dict[str, Any]:
     return {
         "apiVersion": "argoproj.io/v1alpha1",
         "kind": "AnalysisTemplate",
@@ -327,10 +353,10 @@ def _ttft_analysis_template(cfg: DeployConfig) -> dict[str, Any]:
         "spec": {
             "metrics": [
                 {
-                    "name": "p95-ttft-under-1s",
+                    "name": "p95-ttft-slo",
                     "interval": "30s",
                     "count": 4,
-                    "successCondition": "result[0] <= 1.0",
+                    "successCondition": f"result[0] <= {ttft_slo_seconds:.3f}",
                     "provider": {
                         "prometheus": {
                             "address": cfg.prometheus_url,

@@ -35,9 +35,16 @@ class MetricsRegistry:
         )
         self.ttft_seconds = Histogram(
             "gateway_ttft_seconds",
-            "Time to first token observed at RequestControl.",
+            "Time to first token observed at RequestControl on streaming calls.",
             ["pool", "priority"],
             buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+            registry=self.registry,
+        )
+        self.e2el_seconds = Histogram(
+            "gateway_e2el_seconds",
+            "End-to-end request latency observed at RequestControl.",
+            ["pool", "priority"],
+            buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
             registry=self.registry,
         )
         self.fallback_total = Counter(

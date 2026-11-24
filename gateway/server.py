@@ -7,7 +7,7 @@ from pathlib import Path
 import redis
 from starlette.applications import Starlette
 
-from catalog.pool_catalog import load_and_validate
+from catalog.pool_catalog import ModelPoolCatalog, load_and_validate
 from gateway.pool_health import PoolHealth, PoolHealthStore, RedisPoolHealthAdapter
 from gateway.request_control import ReplicaEndpoint, VLLMAdapter, create_app
 from gateway.tenant_budget import (
@@ -47,13 +47,12 @@ def _load_tenants() -> dict[str, TenantRecord]:
     }
 
 
-def _load_replicas() -> dict[str, list[ReplicaEndpoint]]:
+def _load_replicas(catalog: ModelPoolCatalog) -> dict[str, list[ReplicaEndpoint]]:
     raw = os.environ.get("VLLM_ENDPOINTS")
     if not raw:
         return {
-            "pool-8b": [ReplicaEndpoint("8b-0", "http://vllm-8b:8000")],
-            "pool-8b-awq": [ReplicaEndpoint("8b-awq-0", "http://vllm-8b-awq:8001")],
-            "pool-fallback": [ReplicaEndpoint("fb-0", "http://vllm-fallback:8002")],
+            name: [ReplicaEndpoint(replica_id=f"{name}-0", url=f"http://vllm-{name}:8000")]
+            for name in catalog.pools
         }
     parsed = json.loads(raw)
     return {
@@ -91,7 +90,7 @@ def create_default_app() -> Starlette:
         catalog=catalog,
         budget=TenantBudget(adapter=budget_adapter),
         pool_health=pool_health,
-        engine=VLLMAdapter(replicas=_load_replicas()),
+        engine=VLLMAdapter(replicas=_load_replicas(catalog)),
         metrics=MetricsRegistry(),
         metrics_poll_interval_seconds=poll_interval if poll_interval > 0 else None,
     )

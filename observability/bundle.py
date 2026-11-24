@@ -20,10 +20,24 @@ DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL, counter, Total number of NVLink bandwidth co
 """
 
 
+def _burn_rate_expr(
+    pool: str, short_w: str, long_w: str, multiplier: float, err_budget: float
+) -> str:
+    threshold = f"{multiplier * err_budget:.6f}"
+    parts = []
+    for win in (short_w, long_w):
+        err = f'sum(rate(gateway_requests_total{{pool="{pool}",status=~"5.."}}[{win}]))'
+        tot = f'clamp_min(sum(rate(gateway_requests_total{{pool="{pool}"}}[{win}])), 1e-6)'
+        parts.append(f"({err} / {tot}) > {threshold}")
+    return f"{parts[0]} and {parts[1]}"
+
+
 def render_observability_bundle(catalog: ModelPoolCatalog) -> dict[str, str]:
-    """Render Prometheus alerts, scrape config, DCGM CSV, and Grafana dashboard JSON."""
+    """Render Prometheus alerts, scrape config, DCGM DaemonSet/CSV, and Grafana JSON."""
     pool_rules: list[dict[str, Any]] = []
+    vllm_targets: list[str] = []
     for name, spec in catalog.pools.items():
+        vllm_targets.append(f"vllm-{name}:8000")
         ttft_sec = spec.slo_p95_ttft_ms / 1000.0
         err_budget = max(1e-5, 1.0 - spec.slo_availability)
         pool_rules.extend(
@@ -42,15 +56,7 @@ def render_observability_bundle(catalog: ModelPoolCatalog) -> dict[str, str]:
                 },
                 {
                     "alert": f"PoolErrorBudgetFastBurnRate_{name}",
-                    "expr": (
-                        f'(sum(rate(gateway_requests_total{{pool="{name}",status=~"5.."}}[5m])) '
-                        f'/ clamp_min(sum(rate(gateway_requests_total{{pool="{name}"}}[5m])), '
-                        f'1e-6)) > {14.4 * err_budget:.6f} '
-                        f'and '
-                        f'(sum(rate(gateway_requests_total{{pool="{name}",status=~"5.."}}[1h])) '
-                        f'/ clamp_min(sum(rate(gateway_requests_total{{pool="{name}"}}[1h])), '
-                        f'1e-6)) > {14.4 * err_budget:.6f}'
-                    ),
+                    "expr": _burn_rate_expr(name, "5m", "1h", 14.4, err_budget),
                     "labels": {"severity": "critical", "pool": name},
                     "annotations": {
                         "summary": f"Fast error-budget burn rate on {name} (14.4x over 5m & 1h)",
@@ -58,19 +64,21 @@ def render_observability_bundle(catalog: ModelPoolCatalog) -> dict[str, str]:
                 },
                 {
                     "alert": f"PoolErrorBudgetSlowBurnRate_{name}",
-                    "expr": (
-                        f'(sum(rate(gateway_requests_total{{pool="{name}",status=~"5.."}}[30m])) '
-                        f'/ clamp_min(sum(rate(gateway_requests_total{{pool="{name}"}}[30m])), '
-                        f'1e-6)) > {6.0 * err_budget:.6f} '
-                        f'and '
-                        f'(sum(rate(gateway_requests_total{{pool="{name}",status=~"5.."}}[6h])) '
-                        f'/ clamp_min(sum(rate(gateway_requests_total{{pool="{name}"}}[6h])), '
-                        f'1e-6)) > {6.0 * err_budget:.6f}'
-                    ),
+                    "expr": _burn_rate_expr(name, "30m", "6h", 6.0, err_budget),
                     "labels": {"severity": "warning", "pool": name},
                     "annotations": {
                         "summary": f"Slow error-budget burn rate on {name} (6x over 30m & 6h)",
                     },
+                },
+                {
+                    "alert": f"VLLMKVCacheHigh_{name}",
+                    "expr": (
+                        f'avg(vllm:kv_cache_usage_perc{{model_name="{spec.model_id}"}}) '
+                        f'> {max(spec.keda_kv_cache_threshold, 0.90):.2f}'
+                    ),
+                    "for": "2m",
+                    "labels": {"severity": "warning", "pool": name},
+                    "annotations": {"summary": f"vLLM KV cache pressure elevated on {name}"},
                 },
             ]
         )
@@ -83,13 +91,6 @@ def render_observability_bundle(catalog: ModelPoolCatalog) -> dict[str, str]:
             "labels": {"severity": "critical"},
             "annotations": {"summary": "GPU XID error detected on node"},
         },
-        {
-            "alert": "VLLMKVCacheSaturated",
-            "expr": "vllm:kv_cache_usage_perc > 0.95",
-            "for": "2m",
-            "labels": {"severity": "warning"},
-            "annotations": {"summary": "vLLM KV cache usage above 95%"},
-        },
     ]
 
     alerts_doc = {
@@ -100,6 +101,7 @@ def render_observability_bundle(catalog: ModelPoolCatalog) -> dict[str, str]:
     }
     scrape_doc = {
         "global": {"scrape_interval": "15s"},
+        "rule_files": ["alerts.yaml"],
         "scrape_configs": [
             {
                 "job_name": "request-control",
@@ -107,7 +109,7 @@ def render_observability_bundle(catalog: ModelPoolCatalog) -> dict[str, str]:
             },
             {
                 "job_name": "vllm-engines",
-                "static_configs": [{"targets": ["vllm-pool-8b:8000", "vllm-pool-fallback:8000"]}],
+                "static_configs": [{"targets": vllm_targets}],
             },
             {
                 "job_name": "dcgm-exporter",
@@ -115,13 +117,54 @@ def render_observability_bundle(catalog: ModelPoolCatalog) -> dict[str, str]:
             },
         ],
     }
+    dcgm_k8s_docs = [
+        {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "dcgm-counters", "namespace": "monitoring"},
+            "data": {"counters.csv": _DCGM_COUNTERS_CSV},
+        },
+        {
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": {"name": "dcgm-exporter", "namespace": "monitoring"},
+            "spec": {
+                "selector": {"matchLabels": {"app": "dcgm-exporter"}},
+                "template": {
+                    "metadata": {"labels": {"app": "dcgm-exporter"}},
+                    "spec": {
+                        "nodeSelector": {"nvidia.com/gpu.present": "true"},
+                        "tolerations": [{"key": "nvidia.com/gpu", "operator": "Exists"}],
+                        "containers": [
+                            {
+                                "name": "dcgm-exporter",
+                                "image": "nvcr.io/nvidia/k8s/dcgm-exporter:3.3.8-3.6.0-ubuntu22.04",
+                                "args": ["-f", "/etc/dcgm-exporter/counters.csv"],
+                                "ports": [{"containerPort": 9400, "name": "metrics"}],
+                                "volumeMounts": [
+                                    {
+                                        "name": "counters",
+                                        "mountPath": "/etc/dcgm-exporter/counters.csv",
+                                        "subPath": "counters.csv",
+                                    }
+                                ],
+                            }
+                        ],
+                        "volumes": [
+                            {"name": "counters", "configMap": {"name": "dcgm-counters"}}
+                        ],
+                    },
+                },
+            },
+        },
+    ]
     dashboard_doc = {
         "title": "Multi-Tenant LLM Serving Platform",
         "schemaVersion": 39,
         "panels": [
             {
                 "id": 1,
-                "title": "p95 TTFT by Pool (vLLM & Gateway)",
+                "title": "p95 TTFT by Pool (vLLM & RequestControl)",
                 "type": "timeseries",
                 "targets": [
                     {
@@ -160,7 +203,7 @@ def render_observability_bundle(catalog: ModelPoolCatalog) -> dict[str, str]:
             },
             {
                 "id": 4,
-                "title": "Gateway Tokens/s, 429 Shedding & Fallback Rate",
+                "title": "RequestControl Tokens/s, 429 Shedding & Fallback Rate",
                 "type": "timeseries",
                 "targets": [
                     {"expr": "sum(rate(gateway_tokens_total[1m])) by (tenant_id, pool)"},
@@ -189,5 +232,6 @@ def render_observability_bundle(catalog: ModelPoolCatalog) -> dict[str, str]:
         "prometheus-alerts.yaml": yaml.safe_dump(alerts_doc, sort_keys=False),
         "prometheus-scrape.yaml": yaml.safe_dump(scrape_doc, sort_keys=False),
         "dcgm-counters.csv": _DCGM_COUNTERS_CSV,
+        "dcgm-daemonset.yaml": yaml.safe_dump_all(dcgm_k8s_docs, sort_keys=False),
         "grafana-dashboard.json": json.dumps(dashboard_doc, indent=2),
     }

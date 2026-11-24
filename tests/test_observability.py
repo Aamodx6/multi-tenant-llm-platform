@@ -178,10 +178,14 @@ def test_render_observability_bundle_generates_valid_alerts_dcgm_and_grafana() -
     expected = {
         "prometheus-alerts.yaml",
         "dcgm-counters.csv",
+        "dcgm-daemonset.yaml",
         "grafana-dashboard.json",
         "prometheus-scrape.yaml",
     }
     assert expected <= set(bundle)
+    scrape = yaml.safe_load(bundle["prometheus-scrape.yaml"])
+    vllm_targets = scrape["scrape_configs"][1]["static_configs"][0]["targets"]
+    assert vllm_targets == ["vllm-pool-8b:8000", "vllm-pool-fallback:8000"]
     alerts = yaml.safe_load(bundle["prometheus-alerts.yaml"])
     rules = [r for g in alerts["groups"] for r in g["rules"]]
     alert_names = {r["alert"] for r in rules}

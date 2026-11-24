@@ -21,6 +21,7 @@ class WorkloadProfile(BaseModel):
     num_requests: int = Field(default=50, ge=1)
     concurrency: int = Field(default=8, ge=1)
     max_tokens: int = Field(default=256, ge=1)
+    warmup_requests: int = Field(default=0, ge=0)
     stream: bool = True
     system_prompt: str = "You are a concise engineering assistant."
     user_prompt_prefix: str = "Explain Kubernetes scheduling for GPU workloads"
@@ -28,6 +29,15 @@ class WorkloadProfile(BaseModel):
     slo_p95_ttft_ms: float = Field(default=1000.0, gt=0.0)
     max_ttft_regression_pct: float = Field(default=15.0, ge=0.0)
     min_throughput_ratio: float = Field(default=0.85, gt=0.0, le=1.0)
+
+
+class ArmComparison(BaseModel):
+    """Typed A/B comparison deltas between a baseline and candidate BenchmarkReport."""
+
+    ttft_p95_delta_ms: float
+    ttft_p95_speedup_pct: float
+    output_tok_s_delta: float
+    cost_1m_output_delta_usd: float
 
 
 class BenchmarkReport(BaseModel):
@@ -82,7 +92,7 @@ def _percentile(values: list[float], pct: float) -> float:
     return ordered[lo] + (ordered[hi] - ordered[lo]) * (idx - lo)
 
 
-def compare_arms(baseline: BenchmarkReport, candidate: BenchmarkReport) -> dict[str, float]:
+def compare_arms(baseline: BenchmarkReport, candidate: BenchmarkReport) -> ArmComparison:
     """Compute A/B latency, throughput, and cost deltas between two BenchmarkReports."""
     ttft_delta = candidate.ttft_ms_p95 - baseline.ttft_ms_p95
     speedup_pct = (
@@ -90,14 +100,14 @@ def compare_arms(baseline: BenchmarkReport, candidate: BenchmarkReport) -> dict[
         if baseline.ttft_ms_p95 > 0.0
         else 0.0
     )
-    return {
-        "ttft_p95_delta_ms": ttft_delta,
-        "ttft_p95_speedup_pct": speedup_pct,
-        "output_tok_s_delta": candidate.output_tokens_per_sec - baseline.output_tokens_per_sec,
-        "cost_1m_output_delta_usd": (
+    return ArmComparison(
+        ttft_p95_delta_ms=ttft_delta,
+        ttft_p95_speedup_pct=speedup_pct,
+        output_tok_s_delta=candidate.output_tokens_per_sec - baseline.output_tokens_per_sec,
+        cost_1m_output_delta_usd=(
             candidate.cost_per_1m_output_usd - baseline.cost_per_1m_output_usd
         ),
-    }
+    )
 
 
 @dataclass
@@ -136,6 +146,13 @@ class BenchmarkRunner:
         )
         sem = asyncio.Semaphore(profile.concurrency)
         try:
+            if profile.warmup_requests > 0:
+                await asyncio.gather(
+                    *[
+                        self._run_one(client, sem, profile, -(i + 1))
+                        for i in range(profile.warmup_requests)
+                    ]
+                )
             t_start = self._now()
             samples = await asyncio.gather(
                 *[self._run_one(client, sem, profile, idx) for idx in range(profile.num_requests)]
@@ -148,6 +165,10 @@ class BenchmarkRunner:
         report = self._aggregate(profile, samples, duration)
         reasons = _evaluate_verdict(profile, report, baseline)
         return BenchmarkVerdict(report=report, passed=(len(reasons) == 0), reasons=reasons)
+
+    def _error_sample(self, t0: float, status_code: int | None = None) -> _RequestSample:
+        elapsed = (self._now() - t0) * 1000.0
+        return _RequestSample(False, status_code == 429, 0.0, elapsed, [], 0, 0)
 
     async def _run_one(
         self,
@@ -175,16 +196,15 @@ class BenchmarkRunner:
             prev_token_at: float | None = None
             itl_samples: list[float] = []
             prompt_tokens = 0
-            completion_tokens = 0
+            usage_completion_tokens: int | None = None
+            chunk_count = 0
 
             try:
                 if not profile.stream:
                     resp = await client.post("/v1/chat/completions", headers=headers, json=payload)
-                    t_end = self._now()
-                    if resp.status_code == 429:
-                        return _RequestSample(False, True, 0.0, (t_end - t0) * 1000.0, [], 0, 0)
                     if resp.status_code >= 400:
-                        return _RequestSample(False, False, 0.0, (t_end - t0) * 1000.0, [], 0, 0)
+                        return self._error_sample(t0, resp.status_code)
+                    t_end = self._now()
                     usage = resp.json().get("usage", {})
                     elapsed_ms = (t_end - t0) * 1000.0
                     return _RequestSample(
@@ -200,14 +220,8 @@ class BenchmarkRunner:
                 async with client.stream(
                     "POST", "/v1/chat/completions", headers=headers, json=payload
                 ) as resp:
-                    if resp.status_code == 429:
-                        return _RequestSample(
-                            False, True, 0.0, (self._now() - t0) * 1000.0, [], 0, 0
-                        )
                     if resp.status_code >= 400:
-                        return _RequestSample(
-                            False, False, 0.0, (self._now() - t0) * 1000.0, [], 0, 0
-                        )
+                        return self._error_sample(t0, resp.status_code)
                     async for line in resp.aiter_lines():
                         if not line.startswith("data: "):
                             continue
@@ -218,9 +232,8 @@ class BenchmarkRunner:
                         usage = event.get("usage")
                         if isinstance(usage, dict):
                             prompt_tokens = int(usage.get("prompt_tokens", prompt_tokens))
-                            completion_tokens = int(
-                                usage.get("completion_tokens", completion_tokens)
-                            )
+                            if "completion_tokens" in usage:
+                                usage_completion_tokens = int(usage["completion_tokens"])
                         choices = event.get("choices") or []
                         if not choices:
                             continue
@@ -232,12 +245,15 @@ class BenchmarkRunner:
                             elif prev_token_at is not None:
                                 itl_samples.append((now - prev_token_at) * 1000.0)
                             prev_token_at = now
-                            completion_tokens = max(completion_tokens, 1)
+                            chunk_count += 1
 
                 t_end = self._now()
                 e2el_ms = (t_end - t0) * 1000.0
                 ttft_ms = (
                     (first_token_at - t0) * 1000.0 if first_token_at is not None else e2el_ms
+                )
+                completion_tokens = (
+                    usage_completion_tokens if usage_completion_tokens is not None else chunk_count
                 )
                 return _RequestSample(
                     True,
@@ -249,7 +265,7 @@ class BenchmarkRunner:
                     completion_tokens,
                 )
             except httpx.HTTPError:
-                return _RequestSample(False, False, 0.0, (self._now() - t0) * 1000.0, [], 0, 0)
+                return self._error_sample(t0)
 
     def _aggregate(
         self,

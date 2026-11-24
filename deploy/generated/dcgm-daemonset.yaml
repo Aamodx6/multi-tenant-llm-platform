@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dcgm-counters
+  namespace: monitoring
+data:
+  counters.csv: '# NVIDIA DCGM Exporter explicit counters (pre-4.9 and canonical GPU
+    metrics)
+
+    DCGM_FI_DEV_GPU_UTIL, gauge, GPU utilization (in %).
+
+    DCGM_FI_DEV_FB_USED, gauge, Framebuffer memory used (in MiB).
+
+    DCGM_FI_DEV_FB_FREE, gauge, Framebuffer memory free (in MiB).
+
+    DCGM_FI_DEV_GPU_TEMP, gauge, GPU temperature (in C).
+
+    DCGM_FI_DEV_POWER_USAGE, gauge, Power draw (in W).
+
+    DCGM_FI_DEV_XID_ERRORS, gauge, Value of the last XID error encountered.
+
+    DCGM_FI_DEV_ECC_SBE_VOL_TOTAL, counter, Total number of single-bit volatile ECC
+    errors.
+
+    DCGM_FI_DEV_ECC_DBE_VOL_TOTAL, counter, Total number of double-bit volatile ECC
+    errors.
+
+    DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL, counter, Total number of NVLink bandwidth
+    counters.
+
+    '
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dcgm-exporter
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: dcgm-exporter
+  template:
+    metadata:
+      labels:
+        app: dcgm-exporter
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.present: 'true'
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+      containers:
+      - name: dcgm-exporter
+        image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.8-3.6.0-ubuntu22.04
+        args:
+        - -f
+        - /etc/dcgm-exporter/counters.csv
+        ports:
+        - containerPort: 9400
+          name: metrics
+        volumeMounts:
+        - name: counters
+          mountPath: /etc/dcgm-exporter/counters.csv
+          subPath: counters.csv
+      volumes:
+      - name: counters
+        configMap:
+          name: dcgm-counters

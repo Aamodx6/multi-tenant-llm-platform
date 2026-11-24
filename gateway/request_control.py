@@ -97,6 +97,8 @@ class InferenceEngine(Protocol):
 
     def list_replicas(self, pool: str) -> list[ReplicaEndpoint]: ...
 
+    async def scrape_metrics(self) -> None: ...
+
     async def complete(
         self,
         *,
@@ -209,6 +211,9 @@ class FakeEngineAdapter:
 
     def list_replicas(self, pool: str) -> list[ReplicaEndpoint]:
         return list(self._replicas.get(pool, []))
+
+    async def scrape_metrics(self) -> None:
+        return None
 
     async def complete(
         self,
@@ -498,6 +503,20 @@ def _response_headers(pool_name: str, replica_id: str, trace_id: str) -> dict[st
     }
 
 
+def _record_rate_limit(
+    deps: _RuntimeDeps, *, pool: str, tenant_id: str, priority: str, reason: str
+) -> None:
+    if deps.metrics is None:
+        return
+    deps.metrics.rate_limited_total.labels(tenant_id=tenant_id, reason=reason).inc()
+    deps.metrics.requests_total.labels(pool=pool, priority=priority, status="429").inc()
+
+
+def _record_status(deps: _RuntimeDeps, *, pool: str, priority: str, status: str) -> None:
+    if deps.metrics is not None:
+        deps.metrics.requests_total.labels(pool=pool, priority=priority, status=status).inc()
+
+
 def create_app(
     *,
     catalog: ModelPoolCatalog,
@@ -522,13 +541,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
-        scrape_fn = getattr(deps.engine, "scrape_metrics", None)
         task: asyncio.Task[None] | None = None
-        if metrics_poll_interval_seconds is not None and callable(scrape_fn):
+        if metrics_poll_interval_seconds is not None:
 
             async def _poll_loop() -> None:
                 while True:
-                    await scrape_fn()
+                    await deps.engine.scrape_metrics()
                     await asyncio.sleep(metrics_poll_interval_seconds)
 
             task = asyncio.create_task(_poll_loop())
@@ -586,13 +604,13 @@ def create_app(
                 code="invalid_api_key",
             )
         except BudgetExceededError as exc:
-            if deps.metrics is not None:
-                deps.metrics.rate_limited_total.labels(
-                    tenant_id="unknown", reason="budget_exceeded"
-                ).inc()
-                deps.metrics.requests_total.labels(
-                    pool=pool_spec.name, priority="unknown", status="429"
-                ).inc()
+            _record_rate_limit(
+                deps,
+                pool=pool_spec.name,
+                tenant_id="unknown",
+                priority="unknown",
+                reason="budget_exceeded",
+            )
             return _error_response(
                 message=str(exc),
                 status_code=429,
@@ -606,13 +624,13 @@ def create_app(
             await deps.admission.acquire(permit.priority)
         except _AdmissionShedError as exc:
             deps.budget.reconcile(permit, 0)
-            if deps.metrics is not None:
-                deps.metrics.rate_limited_total.labels(
-                    tenant_id=permit.tenant_id, reason="queue_shed"
-                ).inc()
-                deps.metrics.requests_total.labels(
-                    pool=pool_spec.name, priority=str(permit.priority), status="429"
-                ).inc()
+            _record_rate_limit(
+                deps,
+                pool=pool_spec.name,
+                tenant_id=permit.tenant_id,
+                priority=str(permit.priority),
+                reason="queue_shed",
+            )
             return _error_response(
                 message=str(exc),
                 status_code=429,
@@ -636,10 +654,7 @@ def create_app(
         if replica is None:
             deps.admission.release()
             deps.budget.reconcile(permit, 0)
-            if deps.metrics is not None:
-                deps.metrics.requests_total.labels(
-                    pool=pool_spec.name, priority=str(permit.priority), status="503"
-                ).inc()
+            _record_status(deps, pool=pool_spec.name, priority=str(permit.priority), status="503")
             return _error_response(
                 message="No healthy replicas available",
                 status_code=503,
@@ -678,12 +693,10 @@ def create_app(
             deps.admission.release()
 
         if deps.metrics is not None:
-            deps.metrics.ttft_seconds.labels(
+            deps.metrics.e2el_seconds.labels(
                 pool=target_pool.name, priority=str(permit.priority)
             ).observe(max(0.0, time.perf_counter() - t_req))
-            deps.metrics.requests_total.labels(
-                pool=target_pool.name, priority=str(permit.priority), status="200"
-            ).inc()
+        _record_status(deps, pool=target_pool.name, priority=str(permit.priority), status="200")
 
         total_tokens = result.prompt_tokens + result.completion_tokens
         _record_usage_and_reconcile(

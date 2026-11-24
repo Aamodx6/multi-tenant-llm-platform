@@ -8,6 +8,14 @@ from pathlib import Path
 from bench.runner import BenchmarkReport, BenchmarkRunner, WorkloadProfile
 
 
+def load_baseline_report(path: Path) -> BenchmarkReport:
+    """Load either a BenchmarkReport JSON or a BenchmarkVerdict JSON envelope."""
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and "report" in raw:
+        return BenchmarkReport.model_validate(raw["report"])
+    return BenchmarkReport.model_validate(raw)
+
+
 def main() -> int:
     """Run a workload benchmark from CLI flags and optionally gate against a baseline JSON."""
     parser = argparse.ArgumentParser(description="Multi-Tenant LLM Platform Benchmark Runner")
@@ -35,7 +43,7 @@ def main() -> int:
     )
     baseline: BenchmarkReport | None = None
     if args.baseline_json is not None and args.baseline_json.exists():
-        baseline = BenchmarkReport.model_validate_json(args.baseline_json.read_text("utf-8"))
+        baseline = load_baseline_report(args.baseline_json)
 
     verdict = asyncio.run(BenchmarkRunner().run(profile, baseline=baseline))
     output = json.dumps(verdict.model_dump(), indent=2)

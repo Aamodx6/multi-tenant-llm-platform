@@ -70,9 +70,12 @@ def test_render_deploy_manifests_wires_keda_deployments_karpenter_rollouts_and_n
     assert container["startupProbe"]["httpGet"]["path"] == "/health"
 
     rollout_docs = list(yaml.safe_load_all(manifests["rollout-request-control.yaml"]))
-    assert rollout_docs[0]["kind"] == "Rollout"
-    assert rollout_docs[1]["kind"] == "AnalysisTemplate"
-    sec = rollout_docs[0]["spec"]["template"]["spec"]["containers"][0]["securityContext"]
+    assert rollout_docs[0]["kind"] == "Service"
+    assert rollout_docs[1]["kind"] == "Service"
+    assert rollout_docs[2]["kind"] == "Rollout"
+    assert rollout_docs[3]["kind"] == "AnalysisTemplate"
+    assert rollout_docs[3]["spec"]["metrics"][0]["successCondition"] == "result[0] <= 0.600"
+    sec = rollout_docs[2]["spec"]["template"]["spec"]["containers"][0]["securityContext"]
     assert sec["runAsNonRoot"] is True
     assert sec["allowPrivilegeEscalation"] is False
 

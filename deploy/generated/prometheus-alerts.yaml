@@ -30,6 +30,14 @@ groups:
       pool: pool-8b
     annotations:
       summary: Slow error-budget burn rate on pool-8b (6x over 30m & 6h)
+  - alert: VLLMKVCacheHigh_pool-8b
+    expr: avg(vllm:kv_cache_usage_perc{model_name="Qwen/Qwen2.5-7B-Instruct"}) > 0.90
+    for: 2m
+    labels:
+      severity: warning
+      pool: pool-8b
+    annotations:
+      summary: vLLM KV cache pressure elevated on pool-8b
   - alert: PoolHighTTFT_pool-8b-awq
     expr: histogram_quantile(0.95, sum(rate(gateway_ttft_seconds_bucket{pool="pool-8b-awq"}[5m]))
       by (le)) > 1.000
@@ -61,6 +69,15 @@ groups:
       pool: pool-8b-awq
     annotations:
       summary: Slow error-budget burn rate on pool-8b-awq (6x over 30m & 6h)
+  - alert: VLLMKVCacheHigh_pool-8b-awq
+    expr: avg(vllm:kv_cache_usage_perc{model_name="Qwen/Qwen2.5-7B-Instruct-AWQ"})
+      > 0.90
+    for: 2m
+    labels:
+      severity: warning
+      pool: pool-8b-awq
+    annotations:
+      summary: vLLM KV cache pressure elevated on pool-8b-awq
   - alert: PoolHighTTFT_pool-fallback
     expr: histogram_quantile(0.95, sum(rate(gateway_ttft_seconds_bucket{pool="pool-fallback"}[5m]))
       by (le)) > 0.600
@@ -92,6 +109,15 @@ groups:
       pool: pool-fallback
     annotations:
       summary: Slow error-budget burn rate on pool-fallback (6x over 30m & 6h)
+  - alert: VLLMKVCacheHigh_pool-fallback
+    expr: avg(vllm:kv_cache_usage_perc{model_name="Qwen/Qwen2.5-1.5B-Instruct"}) >
+      0.90
+    for: 2m
+    labels:
+      severity: warning
+      pool: pool-fallback
+    annotations:
+      summary: vLLM KV cache pressure elevated on pool-fallback
 - name: llm-platform-gpu-health
   rules:
   - alert: DCGMXidError
@@ -101,10 +127,3 @@ groups:
       severity: critical
     annotations:
       summary: GPU XID error detected on node
-  - alert: VLLMKVCacheSaturated
-    expr: vllm:kv_cache_usage_perc > 0.95
-    for: 2m
-    labels:
-      severity: warning
-    annotations:
-      summary: vLLM KV cache usage above 95%

@@ -1,3 +1,29 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: request-control-stable
+  namespace: llm
+spec:
+  selector:
+    app: request-control
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: request-control-canary
+  namespace: llm
+spec:
+  selector:
+    app: request-control
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+---
 apiVersion: argoproj.io/v1alpha1
 kind: Rollout
 metadata:
@@ -10,6 +36,8 @@ spec:
       app: request-control
   strategy:
     canary:
+      canaryService: request-control-canary
+      stableService: request-control-stable
       steps:
       - setWeight: 5
       - pause:
@@ -42,10 +70,10 @@ metadata:
   namespace: llm
 spec:
   metrics:
-  - name: p95-ttft-under-1s
+  - name: p95-ttft-slo
     interval: 30s
     count: 4
-    successCondition: result[0] <= 1.0
+    successCondition: result[0] <= 0.600
     provider:
       prometheus:
         address: http://prometheus-operated.monitoring:9090

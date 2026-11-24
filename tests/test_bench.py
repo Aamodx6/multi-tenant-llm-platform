@@ -1,7 +1,16 @@
+from pathlib import Path
+
 import httpx
 import pytest
 
-from bench.runner import BenchmarkReport, BenchmarkRunner, WorkloadProfile, compare_arms
+from bench.cli import load_baseline_report
+from bench.runner import (
+    ArmComparison,
+    BenchmarkReport,
+    BenchmarkRunner,
+    WorkloadProfile,
+    compare_arms,
+)
 from catalog.pool_catalog import load_and_validate
 from gateway.pool_health import PoolHealthStore
 from gateway.request_control import FakeEngineAdapter, ReplicaEndpoint, create_app
@@ -104,5 +113,37 @@ async def test_benchmark_runner_collects_sse_metrics_cost_and_checks_regression(
     assert regressed.reasons
 
     delta = compare_arms(fast_baseline, r)
-    assert "ttft_p95_delta_ms" in delta
-    assert "cost_1m_output_delta_usd" in delta
+    assert isinstance(delta, ArmComparison)
+    assert delta.ttft_p95_delta_ms >= 0.0
+
+
+def test_load_baseline_report_accepts_verdict_and_report_json(tmp_path: Path) -> None:
+    report = BenchmarkReport(
+        profile_name="p",
+        model="qwen-7b",
+        total_requests=1,
+        succeeded=1,
+        failed=0,
+        rate_limited_429=0,
+        duration_seconds=1.0,
+        requests_per_sec=1.0,
+        output_tokens_per_sec=10.0,
+        total_tokens_per_sec=20.0,
+        ttft_ms_p50=100.0,
+        ttft_ms_p95=120.0,
+        ttft_ms_p99=130.0,
+        itl_ms_p50=10.0,
+        itl_ms_p95=15.0,
+        e2el_ms_p50=200.0,
+        e2el_ms_p95=250.0,
+        goodput_rps=1.0,
+        cost_per_1m_output_usd=10.0,
+        cost_per_1m_total_usd=5.0,
+    )
+    verdict_file = tmp_path / "verdict.json"
+    verdict_file.write_text(
+        f'{{"report": {report.model_dump_json()}, "passed": true, "reasons": []}}',
+        encoding="utf-8",
+    )
+    loaded = load_baseline_report(verdict_file)
+    assert loaded.ttft_ms_p95 == 120.0

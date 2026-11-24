@@ -11,7 +11,7 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       CATALOG_PATH: /app/catalog/pools.yaml
-      VLLM_ENDPOINTS: '{"pool-8b":["http://vllm-local:8000"],"pool-fallback":["http://vllm-local:8000"]}'
+      VLLM_ENDPOINTS: '{"pool-fallback":["http://vllm-local:8000"]}'
     depends_on:
       - redis
 

@@ -4,7 +4,7 @@
   "panels": [
     {
       "id": 1,
-      "title": "p95 TTFT by Pool (vLLM & Gateway)",
+      "title": "p95 TTFT by Pool (vLLM & RequestControl)",
       "type": "timeseries",
       "targets": [
         {
@@ -46,7 +46,7 @@
     },
     {
       "id": 4,
-      "title": "Gateway Tokens/s, 429 Shedding & Fallback Rate",
+      "title": "RequestControl Tokens/s, 429 Shedding & Fallback Rate",
       "type": "timeseries",
       "targets": [
         {
