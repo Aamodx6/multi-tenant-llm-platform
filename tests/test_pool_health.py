@@ -44,6 +44,10 @@ def test_probe_failures_escalate_to_unhealthy_and_reset_streak() -> None:
     assert store.record_probe("pool-a", ok=False).state == HealthState.DEGRADED
     assert store.record_probe("pool-a", ok=False).state == HealthState.UNHEALTHY
 
+    # set_degraded must not downgrade an already UNHEALTHY pool
+    degraded_call = store.set_degraded("pool-a", "kv_pressure", ttl_seconds=10.0)
+    assert degraded_call.state == HealthState.UNHEALTHY
+
     clock[0] = 30.0
     assert store.record_probe("pool-a", ok=True).state == HealthState.UNHEALTHY
     assert store.record_probe("pool-a", ok=False).state == HealthState.UNHEALTHY

@@ -96,3 +96,22 @@ def test_redis_adapter_atomic_lua_bucket_and_conservative_degraded_fallback() ->
     assert p3.degraded_mode is True
     with pytest.raises(BudgetExceededError):
         degraded_budget.authorize_and_reserve("sk-beta-1", "pool-8b", est_tokens=10)
+
+
+def test_concurrency_cap_blocks_excess_inflight_until_reconcile() -> None:
+    tenant = TenantRecord(
+        tenant_id="gamma",
+        priority=PriorityClass.FREE,
+        tpm_limit=1000,
+        max_concurrency=1,
+    )
+    budget = TenantBudget(
+        adapter=InMemoryBudgetAdapter({hash_api_key("sk-gamma"): tenant})
+    )
+    permit = budget.authorize_and_reserve("sk-gamma", "pool-8b", est_tokens=10)
+    with pytest.raises(BudgetExceededError, match="concurrency"):
+        budget.authorize_and_reserve("sk-gamma", "pool-8b", est_tokens=10)
+
+    budget.reconcile(permit, actual_tokens=5)
+    next_permit = budget.authorize_and_reserve("sk-gamma", "pool-8b", est_tokens=10)
+    assert next_permit.tenant_id == "gamma"

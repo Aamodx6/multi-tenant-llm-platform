@@ -42,12 +42,14 @@ def test_load_and_validate_renders_gateway_keda_and_rollouts_targets() -> None:
     assert catalog.resolve_alias("default").fallback_pool == "pool-fallback"
 
     targets = catalog.render_targets()
-    assert targets["gateway_aliases"]["qwen-7b"] == "pool-8b"
-    assert targets["gateway_fallbacks"]["pool-8b"] == "pool-fallback"
+    assert targets["request_control_aliases"]["qwen-7b"] == "pool-8b"
+    assert targets["request_control_fallbacks"]["pool-8b"] == "pool-fallback"
     assert targets["keda_triggers"]["pool-8b"]["min_replicas"] == 1
     assert targets["keda_triggers"]["pool-8b"]["waiting_threshold"] == 4
     assert targets["rollout_slos"]["pool-8b"]["p95_ttft_ms"] == 1000
     assert targets["rollout_slos"]["pool-fallback"]["availability"] == 0.99
+    assert targets["prefetch_targets"]["pool-8b"]["prefetch_uri"] == "s3://models/Qwen/Qwen2.5-7B-Instruct"
+    assert targets["prefetch_targets"]["pool-8b"]["warmup_prompt"] == "Hello"
 
 
 def test_rejects_unknown_fallback_pool() -> None:

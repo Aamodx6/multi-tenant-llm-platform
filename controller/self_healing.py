@@ -64,12 +64,22 @@ class PlannedAction:
 
 
 @dataclass(frozen=True)
+class AuditEntry:
+    """Structured audit log entry emitted by SelfHealingEngine."""
+
+    outcome: str
+    kind: ActionKind
+    target: str
+    detail: str
+
+
+@dataclass(frozen=True)
 class RemediationPlan:
     """Deterministic output of one SelfHealingEngine reconciliation pass."""
 
     anomaly_scores: dict[str, float]
     actions: list[PlannedAction]
-    audit_log: list[str]
+    audit_log: list[AuditEntry]
 
 
 class ClusterActuator(Protocol):
@@ -79,6 +89,8 @@ class ClusterActuator(Protocol):
 
     def restart_pod(self, pod: str, reason: str) -> None: ...
 
+    def page_human(self, target: str, reason: str) -> None: ...
+
 
 class SimulatedActuatorAdapter:
     """In-memory ClusterActuator adapter for deterministic controller and chaos tests."""
@@ -86,6 +98,7 @@ class SimulatedActuatorAdapter:
     def __init__(self, *, failing_targets: set[str] | None = None) -> None:
         self.drained_nodes: list[str] = []
         self.restarted_pods: list[str] = []
+        self.paged_targets: list[tuple[str, str]] = []
         self.failing_targets = set(failing_targets or set())
 
     def cordon_and_drain(self, node: str, reason: str) -> None:
@@ -98,24 +111,32 @@ class SimulatedActuatorAdapter:
             raise RuntimeError(f"Simulated restart failure on {pod}: {reason}")
         self.restarted_pods.append(pod)
 
+    def page_human(self, target: str, reason: str) -> None:
+        self.paged_targets.append((target, reason))
+
 
 class K8sActuatorAdapter:
-    """Production ClusterActuator adapter delegating node drains and pod restarts to K8s."""
+    """Production ClusterActuator adapter delegating node drains, restarts, and paging."""
 
     def __init__(
         self,
         *,
         drain_fn: Callable[[str, str], None],
         restart_fn: Callable[[str, str], None],
+        page_fn: Callable[[str, str], None],
     ) -> None:
         self._drain_fn = drain_fn
         self._restart_fn = restart_fn
+        self._page_fn = page_fn
 
     def cordon_and_drain(self, node: str, reason: str) -> None:
         self._drain_fn(node, reason)
 
     def restart_pod(self, pod: str, reason: str) -> None:
         self._restart_fn(pod, reason)
+
+    def page_human(self, target: str, reason: str) -> None:
+        self._page_fn(target, reason)
 
 
 def compute_z_score(series: list[float]) -> float:
@@ -142,12 +163,18 @@ class SelfHealingEngine:
         degraded_ttl_seconds: float = 120.0,
         thermal_threshold_c: float = 85.0,
         kv_cache_threshold: float = 0.95,
+        z_score_threshold: float = 3.0,
     ) -> None:
         self._actuator = actuator
         self._pool_health = pool_health
         self._degraded_ttl = degraded_ttl_seconds
         self._thermal_threshold_c = thermal_threshold_c
         self._kv_threshold = kv_cache_threshold
+        self._z_score_threshold = z_score_threshold
+
+    def complete_drain(self, guardrails: GuardrailState, node: str) -> None:
+        """Clear an in-progress node drain once eviction completes."""
+        guardrails.draining_nodes.discard(node)
 
     def reconcile(
         self,
@@ -159,7 +186,8 @@ class SelfHealingEngine:
         candidates: list[tuple[ActionKind, str, str]] = []
 
         for pod in window.pods:
-            scores[pod.pod] = compute_z_score(pod.ttft_ms_series)
+            z = compute_z_score(pod.ttft_ms_series)
+            scores[pod.pod] = z
             has_hw_fault = (
                 pod.xid_errors > 0
                 or pod.ecc_errors > 0
@@ -170,9 +198,13 @@ class SelfHealingEngine:
             if pod.kv_cache_usage >= self._kv_threshold or pod.oom_restarts > 0:
                 candidates.append((ActionKind.MARK_POOL_DEGRADED, pod.pool, "kv_or_oom_pressure"))
                 candidates.append((ActionKind.RESTART_POD, pod.pod, "kv_or_oom_pressure"))
+            elif z >= self._z_score_threshold and pod.kv_cache_usage >= 0.80:
+                candidates.append(
+                    (ActionKind.MARK_POOL_DEGRADED, pod.pool, "ttft_anomaly_pressure")
+                )
 
         actions: list[PlannedAction] = []
-        audit_log: list[str] = []
+        audit_log: list[AuditEntry] = []
         seen: set[tuple[ActionKind, str]] = set()
         for kind, target, reason in candidates:
             key = (kind, target)
@@ -186,7 +218,7 @@ class SelfHealingEngine:
                 and (window.timestamp - last_ts) < guardrails.action_cooldown_seconds
             )
             if in_cooldown:
-                audit_log.append(f"skip:{kind}:{target}:cooldown")
+                audit_log.append(AuditEntry("skip", kind, target, "cooldown"))
                 continue
 
             if (
@@ -194,14 +226,14 @@ class SelfHealingEngine:
                 and guardrails.draining_nodes
                 and target not in guardrails.draining_nodes
             ):
-                audit_log.append(f"skip:{kind}:{target}:max_one_drain")
+                audit_log.append(AuditEntry("skip", kind, target, "max_one_drain"))
                 continue
 
             if guardrails.dry_run:
                 actions.append(
                     PlannedAction(kind=kind, target=target, reason=reason, executed=False)
                 )
-                audit_log.append(f"dry_run:{kind}:{target}:{reason}")
+                audit_log.append(AuditEntry("dry_run", kind, target, reason))
                 continue
 
             try:
@@ -213,21 +245,25 @@ class SelfHealingEngine:
                 actions.append(
                     PlannedAction(kind=kind, target=target, reason=reason, executed=True)
                 )
-                audit_log.append(f"executed:{kind}:{target}:{reason}")
+                audit_log.append(AuditEntry("executed", kind, target, reason))
             except RuntimeError as exc:
                 fails = guardrails.failure_counts.get(key, 0) + 1
                 guardrails.failure_counts[key] = fails
-                audit_log.append(f"failed:{kind}:{target}:{fails}:{exc}")
+                audit_log.append(AuditEntry("failed", kind, target, f"attempt_{fails}:{exc}"))
                 if fails >= guardrails.max_failures_before_page:
+                    esc_reason = f"{kind}_failed_{fails}_times"
+                    self._actuator.page_human(target, esc_reason)
                     actions.append(
                         PlannedAction(
                             kind=ActionKind.ESCALATE_TO_HUMAN,
                             target=target,
-                            reason=f"{kind}_failed_{fails}_times",
+                            reason=esc_reason,
                             executed=True,
                         )
                     )
-                    audit_log.append(f"escalate:{target}:human_page")
+                    audit_log.append(
+                        AuditEntry("escalate", ActionKind.ESCALATE_TO_HUMAN, target, "human_page")
+                    )
 
         return RemediationPlan(anomaly_scores=scores, actions=actions, audit_log=audit_log)
 

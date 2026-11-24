@@ -5,9 +5,8 @@ import hashlib
 import heapq
 import json
 import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
@@ -17,11 +16,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from catalog.pool_catalog import ModelPoolSpec, ValidatedCatalog
+from catalog.pool_catalog import ModelPoolCatalog, ModelPoolSpec
 from gateway.pool_health import HealthState, PoolHealth
 from gateway.tenant_budget import (
     AuthenticationError,
     BudgetExceededError,
+    Permit,
     PriorityClass,
     TenantBudget,
 )
@@ -122,15 +122,7 @@ class _PriorityAdmission:
         self._seq = 0
         self._waiters: list[tuple[int, int, asyncio.Future[None]]] = []
 
-    @asynccontextmanager
-    async def slot(self, priority: PriorityClass) -> AsyncIterator[None]:
-        await self._acquire(priority)
-        try:
-            yield
-        finally:
-            self._release()
-
-    async def _acquire(self, priority: PriorityClass) -> None:
+    async def acquire(self, priority: PriorityClass) -> None:
         if self._in_flight < self._policy.max_in_flight and not self._waiters:
             self._in_flight += 1
             return
@@ -156,7 +148,7 @@ class _PriorityAdmission:
             fut.cancel()
             raise
 
-    def _release(self) -> None:
+    def release(self) -> None:
         while self._waiters:
             _, _, fut = heapq.heappop(self._waiters)
             if not fut.done():
@@ -166,7 +158,7 @@ class _PriorityAdmission:
 
 
 class FakeEngineAdapter:
-    """In-memory InferenceEngine adapter for deterministic gateway tests."""
+    """In-memory InferenceEngine adapter for deterministic RequestControl tests."""
 
     def __init__(
         self,
@@ -310,30 +302,69 @@ def _estimate_prompt_tokens(messages: list[dict[str, Any]] | list[ChatMessage]) 
     return max(1, total_words)
 
 
-def _extract_bearer_token(request: Request) -> str:
+def _extract_api_key(request: Request) -> str:
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
     return ""
 
 
+@dataclass(frozen=True)
+class UsageEvent:
+    """Metered token consumption emitted per completed or aborted request."""
+
+    trace_id: str
+    tenant_id: str
+    pool: str
+    tokens: int
+
+
 @dataclass
 class _RuntimeDeps:
-    catalog: ValidatedCatalog
+    catalog: ModelPoolCatalog
     budget: TenantBudget
     pool_health: PoolHealth
     engine: InferenceEngine
     admission: _PriorityAdmission
-    usage_events: list[dict[str, Any]] = field(default_factory=list)
+    on_usage: Callable[[UsageEvent], None] | None = None
+
+
+def _record_usage_and_reconcile(
+    *,
+    deps: _RuntimeDeps,
+    permit: Permit,
+    pool_name: str,
+    total_tokens: int,
+    trace_id: str,
+) -> None:
+    deps.budget.reconcile(permit, total_tokens)
+    if deps.on_usage is not None:
+        deps.on_usage(
+            UsageEvent(
+                trace_id=trace_id,
+                tenant_id=permit.tenant_id,
+                pool=pool_name,
+                tokens=total_tokens,
+            )
+        )
+
+
+def _response_headers(pool_name: str, replica_id: str, trace_id: str) -> dict[str, str]:
+    return {
+        "x-served-pool": pool_name,
+        "x-served-replica": replica_id,
+        "x-trace-id": trace_id,
+    }
 
 
 def create_app(
     *,
-    catalog: ValidatedCatalog,
+    catalog: ModelPoolCatalog,
     budget: TenantBudget,
     pool_health: PoolHealth,
     engine: InferenceEngine,
     admission_policy: AdmissionPolicy | None = None,
+    on_usage: Callable[[UsageEvent], None] | None = None,
 ) -> Starlette:
     """Create the unified RequestControl ASGI application."""
     deps = _RuntimeDeps(
@@ -342,6 +373,7 @@ def create_app(
         pool_health=pool_health,
         engine=engine,
         admission=_PriorityAdmission(admission_policy or AdmissionPolicy()),
+        on_usage=on_usage,
     )
 
     async def chat_completions(request: Request) -> Response:
@@ -358,7 +390,7 @@ def create_app(
         est_total = est_prompt + req.max_tokens
         try:
             permit = deps.budget.authorize_and_reserve(
-                _extract_bearer_token(request),
+                _extract_api_key(request),
                 pool_spec.name,
                 est_total,
             )
@@ -372,7 +404,7 @@ def create_app(
             )
 
         try:
-            await deps.admission._acquire(permit.priority)
+            await deps.admission.acquire(permit.priority)
         except _AdmissionShedError as exc:
             deps.budget.reconcile(permit, 0)
             return JSONResponse(
@@ -387,7 +419,7 @@ def create_app(
             messages=req.messages,
         )
         if replica is None:
-            deps.admission._release()
+            deps.admission.release()
             deps.budget.reconcile(permit, 0)
             return JSONResponse({"error": "No healthy replicas available"}, status_code=503)
 
@@ -411,17 +443,15 @@ def create_app(
                 payload=req.model_dump(),
             )
         finally:
-            deps.admission._release()
+            deps.admission.release()
 
         total_tokens = result.prompt_tokens + result.completion_tokens
-        deps.budget.reconcile(permit, total_tokens)
-        deps.usage_events.append(
-            {
-                "trace_id": trace_id,
-                "tenant_id": permit.tenant_id,
-                "pool": target_pool.name,
-                "tokens": total_tokens,
-            }
+        _record_usage_and_reconcile(
+            deps=deps,
+            permit=permit,
+            pool_name=target_pool.name,
+            total_tokens=total_tokens,
+            trace_id=trace_id,
         )
         return JSONResponse(
             {
@@ -441,11 +471,7 @@ def create_app(
                     "total_tokens": total_tokens,
                 },
             },
-            headers={
-                "x-served-pool": target_pool.name,
-                "x-served-replica": result.replica_id,
-                "x-trace-id": trace_id,
-            },
+            headers=_response_headers(target_pool.name, result.replica_id, trace_id),
         )
 
     return Starlette(routes=[Route("/v1/chat/completions", chat_completions, methods=["POST"])])
@@ -456,7 +482,7 @@ def _streaming_chat_response(
     deps: _RuntimeDeps,
     request: Request,
     req: ChatCompletionRequest,
-    permit: Any,
+    permit: Permit,
     target_pool: ModelPoolSpec,
     replica: ReplicaEndpoint,
     est_prompt: int,
@@ -496,25 +522,19 @@ def _streaming_chat_response(
                         )
             finally:
                 total_tokens = est_prompt + emitted_tokens
-                deps.budget.reconcile(permit, total_tokens)
-                deps.usage_events.append(
-                    {
-                        "trace_id": trace_id,
-                        "tenant_id": permit.tenant_id,
-                        "pool": target_pool.name,
-                        "tokens": total_tokens,
-                    }
+                _record_usage_and_reconcile(
+                    deps=deps,
+                    permit=permit,
+                    pool_name=target_pool.name,
+                    total_tokens=total_tokens,
+                    trace_id=trace_id,
                 )
-                deps.admission._release()
+                deps.admission.release()
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={
-            "x-served-pool": target_pool.name,
-            "x-served-replica": replica.replica_id,
-            "x-trace-id": trace_id,
-        },
+        headers=_response_headers(target_pool.name, replica.replica_id, trace_id),
     )
 
 

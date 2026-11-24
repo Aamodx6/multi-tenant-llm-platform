@@ -1,5 +1,6 @@
 from controller.self_healing import (
     ActionKind,
+    AuditEntry,
     GuardrailState,
     PodTelemetry,
     SelfHealingEngine,
@@ -87,13 +88,23 @@ def test_guardrails_dry_run_max_one_drain_cooldown_and_two_failure_escalation() 
     assert all(not a.executed for a in dry_plan.actions)
     assert actuator.drained_nodes == []
 
-    # Live run drains at most one node at a time
+    # Live run drains at most one node at a time, and releases once drain completes
     guardrails = GuardrailState(action_cooldown_seconds=60.0)
     live_plan = engine.reconcile(two_bad_nodes, guardrails)
     assert actuator.drained_nodes == ["node-a"]
-    assert any("max_one_drain" in entry for entry in live_plan.audit_log)
+    assert AuditEntry("skip", ActionKind.CORDON_AND_DRAIN, "node-b", "max_one_drain") in (
+        live_plan.audit_log
+    )
+    engine.complete_drain(guardrails, "node-a")
+    next_plan = engine.reconcile(
+        TelemetryWindow(timestamp=110.0, pods=two_bad_nodes.pods),
+        guardrails,
+    )
+    assert (ActionKind.CORDON_AND_DRAIN, "node-b") in [
+        (a.kind, a.target) for a in next_plan.actions
+    ]
 
-    # Failing pod restart twice triggers human escalation
+    # Failing pod restart twice triggers human escalation via ClusterActuator.page_human
     failing_pod_window = TelemetryWindow(
         timestamp=200.0,
         pods=[
@@ -117,4 +128,34 @@ def test_guardrails_dry_run_max_one_drain_cooldown_and_two_failure_escalation() 
     assert (ActionKind.ESCALATE_TO_HUMAN, "vllm-8b-bad") in [
         (a.kind, a.target) for a in second_try.actions
     ]
-    assert any("skip:mark_pool_degraded:pool-8b:cooldown" in e for e in second_try.audit_log)
+    assert actuator.paged_targets == [("vllm-8b-bad", "restart_pod_failed_2_times")]
+    assert AuditEntry("skip", ActionKind.MARK_POOL_DEGRADED, "pool-8b", "cooldown") in (
+        second_try.audit_log
+    )
+
+
+def test_ttft_zscore_anomaly_with_elevated_kv_marks_pool_degraded() -> None:
+    pool_health = PoolHealthStore()
+    actuator = SimulatedActuatorAdapter()
+    engine = SelfHealingEngine(actuator=actuator, pool_health=pool_health)
+
+    plan = engine.reconcile(
+        TelemetryWindow(
+            timestamp=300.0,
+            pods=[
+                PodTelemetry(
+                    pod="vllm-8b-2",
+                    node="gpu-node-3",
+                    pool="pool-8b",
+                    kv_cache_usage=0.84,
+                    gpu_temp_c=70.0,
+                    ttft_ms_series=[100.0, 102.0, 99.0, 101.0, 450.0],
+                )
+            ],
+        ),
+        GuardrailState(),
+    )
+    assert (ActionKind.MARK_POOL_DEGRADED, "pool-8b") in [
+        (a.kind, a.target) for a in plan.actions
+    ]
+    assert pool_health.get_state("pool-8b").state == HealthState.DEGRADED

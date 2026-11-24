@@ -1,15 +1,15 @@
 from catalog.pool_catalog import (
     CatalogValidationError,
     IsolationMode,
+    ModelPoolCatalog,
     ModelPoolSpec,
-    ValidatedCatalog,
     load_and_validate,
 )
 
 __all__ = [
     "CatalogValidationError",
     "IsolationMode",
+    "ModelPoolCatalog",
     "ModelPoolSpec",
-    "ValidatedCatalog",
     "load_and_validate",
 ]

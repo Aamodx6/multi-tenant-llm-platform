@@ -83,7 +83,7 @@ class _Bucket:
 
 
 class InMemoryBudgetAdapter:
-    """In-process token-bucket adapter for deterministic unit and gateway tests."""
+    """In-process token-bucket adapter for deterministic RequestControl tests."""
 
     def __init__(
         self,
@@ -94,12 +94,14 @@ class InMemoryBudgetAdapter:
         self._keys = dict(keys_by_hash)
         self._now = now_fn
         self._buckets: dict[str, _Bucket] = {}
+        self._caps: dict[str, int] = {}
 
     def lookup_tenant(self, key_hash: str) -> TenantRecord | None:
         return self._keys.get(key_hash)
 
     def reserve(self, tenant: TenantRecord, model: str, est_tokens: int) -> Permit:
         now = self._now()
+        self._caps[tenant.tenant_id] = tenant.tpm_limit
         bucket = self._refill(tenant, now)
         if bucket.tokens < est_tokens:
             retry = _retry_after_seconds(est_tokens, bucket.tokens, tenant.tpm_limit)
@@ -121,7 +123,8 @@ class InMemoryBudgetAdapter:
         bucket = self._buckets.get(permit.tenant_id)
         if bucket is None or delta == 0:
             return
-        bucket.tokens = max(0.0, bucket.tokens + delta)
+        cap = float(self._caps.get(permit.tenant_id, max(permit.reserved_tokens, 1)))
+        bucket.tokens = min(cap, max(0.0, bucket.tokens + delta))
 
     def _refill(self, tenant: TenantRecord, now: float) -> _Bucket:
         bucket = self._buckets.get(tenant.tenant_id)
@@ -190,7 +193,7 @@ class RedisPostgresAdapter:
         pg_lookup: Callable[[str], TenantRecord | None],
         degraded_tpm_ratio: float = 0.25,
         key_cache_ttl_seconds: int = 300,
-        now_fn: Callable[[], float] = time.monotonic,
+        now_fn: Callable[[], float] = time.time,
     ) -> None:
         self._redis = redis_client
         self._pg_lookup = pg_lookup
@@ -291,22 +294,34 @@ class RedisPostgresAdapter:
 
 
 class TenantBudget:
-    """Deep module encapsulating API key auth, token reservation, and usage reconciliation."""
+    """Deep module encapsulating API key auth, concurrency & token limits, and reconciliation."""
 
     def __init__(self, adapter: BudgetAdapter) -> None:
         self._adapter = adapter
+        self._active_permits: dict[str, set[str]] = {}
 
     def authorize_and_reserve(
         self, api_key: str, model: str, est_tokens: int
     ) -> Permit:
-        """Authenticate an API key and reserve est_tokens against the tenant's bucket."""
+        """Authenticate an API key and reserve concurrency + est_tokens against the tenant."""
         if not api_key:
             raise AuthenticationError("Missing API key.")
         tenant = self._adapter.lookup_tenant(hash_api_key(api_key))
         if tenant is None:
             raise AuthenticationError("Invalid API key.")
-        return self._adapter.reserve(tenant, model, est_tokens)
+        active = self._active_permits.setdefault(tenant.tenant_id, set())
+        if len(active) >= tenant.max_concurrency:
+            raise BudgetExceededError(
+                f"Tenant '{tenant.tenant_id}' exceeded concurrency cap ({tenant.max_concurrency}).",
+                retry_after_seconds=1,
+            )
+        permit = self._adapter.reserve(tenant, model, est_tokens)
+        active.add(permit.permit_id)
+        return permit
 
     def reconcile(self, permit: Permit, actual_tokens: int) -> None:
-        """Reconcile actual streamed/completed tokens against the issued permit."""
+        """Release concurrency slot and reconcile actual tokens against the issued permit."""
+        active = self._active_permits.get(permit.tenant_id)
+        if active is not None:
+            active.discard(permit.permit_id)
         self._adapter.reconcile(permit, max(0, actual_tokens))

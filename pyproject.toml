@@ -2,7 +2,7 @@
 name = "multi-tenant-llm-platform"
 version = "0.1.0"
 description = "Multi-Tenant LLM Serving Platform deepened core modules"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
   "pydantic>=2.0",
   "pyyaml>=6.0",

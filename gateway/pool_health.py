@@ -78,8 +78,9 @@ class PoolHealthStore:
         """Mark a pool degraded for at least ttl_seconds without mutating deployment args."""
         now = self._now()
         rec = self._records.setdefault(pool, _PoolRecord())
-        rec.state = HealthState.DEGRADED
-        rec.reason = reason
+        if rec.state != HealthState.UNHEALTHY:
+            rec.state = HealthState.DEGRADED
+            rec.reason = reason
         rec.override_until = max(rec.override_until, now + ttl_seconds)
         rec.last_transition_at = now
         rec.consecutive_ok = 0

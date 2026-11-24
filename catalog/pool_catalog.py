@@ -28,6 +28,8 @@ class ModelPoolSpec(BaseModel):
     quantization: str = "fp16"
     isolation: IsolationMode = IsolationMode.SHARED
     fallback_pool: str | None = None
+    prefetch_uri: str | None = None
+    warmup_prompt: str = "Hello"
     min_replicas: int = Field(ge=0)
     max_replicas: int = Field(ge=1)
     keda_waiting_threshold: int = Field(gt=0)
@@ -45,7 +47,7 @@ class ModelPoolSpec(BaseModel):
         return self
 
 
-class ValidatedCatalog:
+class ModelPoolCatalog:
     """Validated single source of truth for model pools and downstream target configs."""
 
     def __init__(self, pools: dict[str, ModelPoolSpec], aliases: dict[str, str]) -> None:
@@ -62,8 +64,8 @@ class ValidatedCatalog:
         return self.pools[pool_name]
 
     def render_targets(self) -> dict[str, Any]:
-        """Render target configurations for RequestControl, KEDA, and Argo Rollouts."""
-        gateway_fallbacks = {
+        """Render target configs for RequestControl, KEDA, Rollouts, and NVMe prefetch."""
+        request_control_fallbacks = {
             name: spec.fallback_pool
             for name, spec in self.pools.items()
             if spec.fallback_pool is not None
@@ -84,15 +86,24 @@ class ValidatedCatalog:
             }
             for name, spec in self.pools.items()
         }
+        prefetch_targets = {
+            name: {
+                "model_id": spec.model_id,
+                "prefetch_uri": spec.prefetch_uri or f"s3://models/{spec.model_id}",
+                "warmup_prompt": spec.warmup_prompt,
+            }
+            for name, spec in self.pools.items()
+        }
         return {
-            "gateway_aliases": dict(self._aliases),
-            "gateway_fallbacks": gateway_fallbacks,
+            "request_control_aliases": dict(self._aliases),
+            "request_control_fallbacks": request_control_fallbacks,
             "keda_triggers": keda_triggers,
             "rollout_slos": rollout_slos,
+            "prefetch_targets": prefetch_targets,
         }
 
 
-def load_and_validate(catalog_yaml: str) -> ValidatedCatalog:
+def load_and_validate(catalog_yaml: str) -> ModelPoolCatalog:
     """Parse and validate a model pool catalog YAML document."""
     raw = yaml.safe_load(catalog_yaml)
     if not isinstance(raw, dict) or not isinstance(raw.get("pools"), dict):
@@ -116,7 +127,7 @@ def load_and_validate(catalog_yaml: str) -> ValidatedCatalog:
             aliases[alias] = pool_name
 
     _validate_fallback_graph(pools)
-    return ValidatedCatalog(pools=pools, aliases=aliases)
+    return ModelPoolCatalog(pools=pools, aliases=aliases)
 
 
 def _validate_fallback_graph(pools: dict[str, ModelPoolSpec]) -> None:
