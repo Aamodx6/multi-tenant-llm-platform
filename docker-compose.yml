@@ -11,6 +11,7 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       CATALOG_PATH: /app/catalog/pools.yaml
+      CACHE_SALT_SECRET: ${CACHE_SALT_SECRET:-local-dev-cache-salt-secret}
       VLLM_ENDPOINTS: '{"pool-fallback":["http://vllm-local:8000"]}'
     depends_on:
       - redis
@@ -38,13 +39,15 @@ services:
       - prometheus
 
   vllm-local:
-    image: vllm/vllm-openai:v0.7.3
+    image: vllm/vllm-openai:v0.9.0
     profiles: ["gpu"]
     ports:
       - "8000:8000"
     ipc: host
     command:
       - --model
+      - Qwen/Qwen2.5-1.5B-Instruct
+      - --served-model-name
       - Qwen/Qwen2.5-1.5B-Instruct
       - --dtype
       - auto
@@ -53,6 +56,8 @@ services:
       - --gpu-memory-utilization
       - "0.85"
       - --enable-prefix-caching
+      - --prefix-caching-hash-algo
+      - sha256
     deploy:
       resources:
         reservations:

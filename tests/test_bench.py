@@ -147,3 +147,42 @@ def test_load_baseline_report_accepts_verdict_and_report_json(tmp_path: Path) ->
     )
     loaded = load_baseline_report(verdict_file)
     assert loaded.ttft_ms_p95 == 120.0
+
+
+@pytest.mark.anyio
+async def test_benchmark_runner_fails_when_error_rate_exceeds_min_success_rate() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                },
+            )
+        return httpx.Response(503, json={"error": {"message": "down"}})
+
+    profile = WorkloadProfile(
+        name="error-gate",
+        base_url="http://test",
+        api_key="sk-bench",
+        model="qwen-7b",
+        num_requests=5,
+        concurrency=1,
+        stream=False,
+        slo_p95_ttft_ms=1000.0,
+        min_success_rate=0.95,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        verdict = await BenchmarkRunner(client=client).run(profile)
+
+    assert verdict.report.succeeded == 1
+    assert verdict.report.failed == 4
+    assert verdict.passed is False
+    assert any("success rate" in r.lower() for r in verdict.reasons)

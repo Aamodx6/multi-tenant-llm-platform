@@ -23,6 +23,11 @@ spec:
         values:
         - g6
         - g5
+      - key: karpenter.k8s.aws/instance-size
+        operator: In
+        values:
+        - 2xlarge
+        - 4xlarge
       nodeClassRef:
         group: karpenter.k8s.aws
         kind: EC2NodeClass

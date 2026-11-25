@@ -19,15 +19,25 @@ from gateway.tenant_budget import (
     RedisPostgresAdapter,
     TenantBudget,
     TenantRecord,
+    build_pg_lookup,
     hash_api_key,
 )
 from gateway.usage_rollup import RedisStreamUsageSink
 from observability.metrics import MetricsRegistry
 
 
-def _load_tenants() -> dict[str, TenantRecord]:
+def _load_tenants(
+    *, is_production: bool = False, has_database: bool = False
+) -> dict[str, TenantRecord]:
     raw_json = os.environ.get("TENANTS_JSON")
     if not raw_json:
+        if has_database:
+            return {}
+        if is_production:
+            raise RuntimeError(
+                "TENANTS_JSON or DATABASE_URL must be configured in production; "
+                "default demo keys are disabled."
+            )
         demo_paid = TenantRecord(
             "demo-paid", PriorityClass.PAID, tpm_limit=120_000, max_concurrency=16
         )
@@ -71,27 +81,44 @@ def create_default_app() -> Starlette:
     """Build RequestControl app from environment variables and catalog/pools.yaml."""
     catalog_path = Path(os.environ.get("CATALOG_PATH", "catalog/pools.yaml"))
     catalog = load_and_validate(catalog_path.read_text(encoding="utf-8"))
-    keys_by_hash = _load_tenants()
 
     redis_url = os.environ.get("REDIS_URL")
+    database_url = os.environ.get("DATABASE_URL")
     gateway_replicas = int(os.environ.get("GATEWAY_REPLICAS", "1"))
     is_production = os.environ.get("ENVIRONMENT", "").lower() == "production"
+    keys_by_hash = _load_tenants(
+        is_production=is_production,
+        has_database=bool(database_url),
+    )
+    pg_lookup = (
+        build_pg_lookup(database_url, keys_by_hash)
+        if database_url
+        else keys_by_hash.get
+    )
+
     raw_salt_secret = os.environ.get("CACHE_SALT_SECRET")
     if (is_production or gateway_replicas > 1) and not raw_salt_secret:
         raise RuntimeError(
             "CACHE_SALT_SECRET must be set in production or multi-replica gateway deployments."
         )
     cache_salt_secret = raw_salt_secret.encode("utf-8") if raw_salt_secret else None
+    metrics_auth_token = os.environ.get("METRICS_BEARER_TOKEN") or None
+    max_request_bytes = int(os.environ.get("MAX_REQUEST_BYTES", str(4 * 1024 * 1024)))
 
     budget_adapter: BudgetAdapter
     pool_health: PoolHealth
     on_usage: Callable[[UsageEvent], None] | None = None
     on_usage_flush: Callable[[], Any] | None = None
     if redis_url:
-        client = redis.Redis.from_url(redis_url, decode_responses=True)
+        client = redis.Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=0.5,
+            socket_timeout=1.0,
+        )
         budget_adapter = RedisPostgresAdapter(
             redis_client=client,
-            pg_lookup=keys_by_hash.get,
+            pg_lookup=pg_lookup,
             gateway_replicas=gateway_replicas,
         )
         pool_health = RedisPoolHealthAdapter(redis_client=client)
@@ -99,7 +126,10 @@ def create_default_app() -> Starlette:
         on_usage = usage_sink.emit
         on_usage_flush = usage_sink.flush
     else:
-        budget_adapter = InMemoryBudgetAdapter(keys_by_hash)
+        budget_adapter = InMemoryBudgetAdapter(
+            keys_by_hash,
+            pg_lookup=pg_lookup if database_url else None,
+        )
         pool_health = PoolHealthStore()
 
     poll_interval = float(os.environ.get("METRICS_POLL_INTERVAL_SECONDS", "5.0"))
@@ -113,6 +143,8 @@ def create_default_app() -> Starlette:
         on_usage=on_usage,
         on_usage_flush=on_usage_flush,
         cache_salt_secret=cache_salt_secret,
+        max_request_bytes=max_request_bytes,
+        metrics_auth_token=metrics_auth_token,
     )
 
 

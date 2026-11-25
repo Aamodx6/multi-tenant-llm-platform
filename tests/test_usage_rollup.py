@@ -7,7 +7,11 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from gateway.request_control import UsageEvent
-from gateway.usage_rollup import BillingRollupWorker, RedisStreamUsageSink
+from gateway.usage_rollup import (
+    BillingRollupWorker,
+    RedisStreamUsageSink,
+    normalize_database_url,
+)
 
 
 def test_redis_stream_usage_sink_and_rollup_idempotent_dedup_and_xack() -> None:
@@ -181,3 +185,81 @@ def test_caller_reused_trace_id_cannot_bypass_billing_and_trimmed_entries_do_not
             text("SELECT total_tokens, request_count FROM tenant_usage_hourly")
         ).fetchone()
     assert total == (100, 2)
+
+
+def test_normalize_database_url_and_poison_pill_dlq_recovery() -> None:
+    assert normalize_database_url("postgresql://u:p@db:5432/llm") == (
+        "postgresql+psycopg://u:p@db:5432/llm"
+    )
+    assert normalize_database_url("postgres://u:p@db:5432/llm") == (
+        "postgresql+psycopg://u:p@db:5432/llm"
+    )
+    assert normalize_database_url("sqlite:///:memory:") == "sqlite:///:memory:"
+
+    redis_client = fakeredis.FakeRedis(decode_responses=True)
+    db_engine = create_engine("sqlite:///:memory:")
+    sink = RedisStreamUsageSink(redis_client=redis_client)
+
+    # First event triggers a deterministic DB failure (poison pill); second is valid
+    sink.emit(
+        UsageEvent(
+            trace_id="poison-1",
+            event_id="evt-poison",
+            tenant_id="tenant-a",
+            pool="pool-8b",
+            tokens=10,
+            prompt_tokens=5,
+            completion_tokens=5,
+        )
+    )
+    sink.emit(
+        UsageEvent(
+            trace_id="good-1",
+            event_id="evt-good",
+            tenant_id="tenant-a",
+            pool="pool-8b",
+            tokens=40,
+            prompt_tokens=20,
+            completion_tokens=20,
+        )
+    )
+
+    class _PoisonOnceEngine:
+        def begin(self) -> object:
+            raise RuntimeError("transient failure")
+
+    bad_worker = BillingRollupWorker(
+        redis_client=redis_client,
+        db_engine=_PoisonOnceEngine(),  # type: ignore[arg-type]
+        consumer_name="dead-w",
+        max_deliveries=2,
+    )
+    bad_worker._ensure_group()
+    with pytest.raises(RuntimeError):
+        bad_worker.run_once(count=1)
+
+    # Recovery worker claims stale message (delivery #2 >= max_deliveries=2),
+    # quarantines poison pill to DLQ, and processes good-1
+    good_worker = BillingRollupWorker(
+        redis_client=redis_client,
+        db_engine=db_engine,
+        consumer_name="good-w",
+        max_deliveries=2,
+    )
+    good_worker.ensure_schema()
+    good_worker.recover_stale(min_idle_ms=0, count=10)
+    good_worker.run_once(count=10)
+
+    dlq_entries = redis_client.xrange(f"{sink.stream_key}:dlq")
+    assert dlq_entries is not None
+    assert len(dlq_entries) == 1
+    dlq_fields = dlq_entries[0][1]
+    assert dlq_fields is not None
+    assert dlq_fields["event_id"] == "evt-poison"
+    assert redis_client.xpending(sink.stream_key, good_worker.group_name)["pending"] == 0
+
+    with db_engine.connect() as conn:
+        total = conn.execute(
+            text("SELECT total_tokens, request_count FROM tenant_usage_hourly")
+        ).fetchone()
+    assert total == (40, 1)

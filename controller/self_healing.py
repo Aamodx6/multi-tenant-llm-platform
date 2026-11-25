@@ -90,9 +90,13 @@ class GuardrailState:
 
     dry_run: bool = False
     draining_nodes: set[str] = field(default_factory=set)
+    draining_started_at: dict[str, float] = field(default_factory=dict)
     last_action_at: dict[tuple[ActionKind, str], float] = field(default_factory=dict)
+    last_escalated_at: dict[tuple[ActionKind, str], float] = field(default_factory=dict)
     failure_counts: dict[tuple[ActionKind, str], int] = field(default_factory=dict)
     action_cooldown_seconds: float = 60.0
+    drain_timeout_seconds: float = 300.0
+    escalation_cooldown_seconds: float = 300.0
     max_failures_before_page: int = 2
 
 
@@ -209,19 +213,19 @@ class K8sActuatorAdapter:
 
 
 def compute_z_score(series: list[float], *, min_delta: float = 25.0) -> float:
-    """Compute Iglewicz-Hoaglin MAD Modified Z-Score for the latest telemetry point."""
+    """Compute Iglewicz-Hoaglin MAD Modified Z-Score for upward latency spikes."""
     if len(series) < 3:
         return 0.0
     baseline = series[:-1]
     med = statistics.median(baseline)
     deviations = [abs(x - med) for x in baseline]
     mad = statistics.median(deviations)
-    latest_diff = abs(series[-1] - med)
+    signed_diff = series[-1] - med
     if mad < 1e-6:
-        return 0.0 if latest_diff < min_delta else 10.0
-    if latest_diff < min_delta:
+        return 0.0 if signed_diff < min_delta else 10.0
+    if signed_diff < min_delta:
         return 0.0
-    return 0.6745 * (series[-1] - med) / mad
+    return 0.6745 * signed_diff / mad
 
 
 class SelfHealingEngine:
@@ -255,6 +259,7 @@ class SelfHealingEngine:
     def complete_drain(self, guardrails: GuardrailState, node: str) -> None:
         """Clear an in-progress node drain once eviction completes."""
         guardrails.draining_nodes.discard(node)
+        guardrails.draining_started_at.pop(node, None)
 
     def _is_multivariate_anomaly(self, pod: PodTelemetry) -> bool:
         if self._iso_forest is None or not pod.ttft_ms_series:
@@ -272,6 +277,14 @@ class SelfHealingEngine:
         guardrails: GuardrailState,
     ) -> RemediationPlan:
         """Score a TelemetryWindow, plan actions under guardrails, and invoke ClusterActuator."""
+        for node in list(guardrails.draining_nodes):
+            started = guardrails.draining_started_at.get(node)
+            if (
+                started is not None
+                and (window.timestamp - started) >= guardrails.drain_timeout_seconds
+            ):
+                self.complete_drain(guardrails, node)
+
         scores: dict[str, float] = {}
         candidates: list[tuple[ActionKind, str, str]] = []
 
@@ -289,7 +302,8 @@ class SelfHealingEngine:
                 candidates.append((ActionKind.CORDON_AND_DRAIN, pod.node, "gpu_hardware_fault"))
             if pod.kv_cache_usage >= self._kv_threshold or pod.oom_restarts > 0:
                 candidates.append((ActionKind.MARK_POOL_DEGRADED, pod.pool, "kv_or_oom_pressure"))
-                candidates.append((ActionKind.RESTART_POD, pod.pod, "kv_or_oom_pressure"))
+                if pod.oom_restarts > 0 or pod.kv_cache_usage >= 0.98:
+                    candidates.append((ActionKind.RESTART_POD, pod.pod, "kv_or_oom_pressure"))
             elif (z >= self._z_score_threshold and pod.kv_cache_usage >= 0.80) or (
                 self._is_multivariate_anomaly(pod)
             ):
@@ -336,6 +350,7 @@ class SelfHealingEngine:
                 guardrails.failure_counts[key] = 0
                 if kind == ActionKind.CORDON_AND_DRAIN:
                     guardrails.draining_nodes.add(target)
+                    guardrails.draining_started_at[target] = window.timestamp
                 actions.append(
                     PlannedAction(kind=kind, target=target, reason=reason, executed=True)
                 )
@@ -352,9 +367,15 @@ class SelfHealingEngine:
                     self._metrics.remediation_actions_total.labels(
                         kind=str(kind), outcome="failed"
                     ).inc()
-                if fails >= guardrails.max_failures_before_page:
+                last_esc = guardrails.last_escalated_at.get(key)
+                esc_ready = (
+                    last_esc is None
+                    or (window.timestamp - last_esc) >= guardrails.escalation_cooldown_seconds
+                )
+                if fails >= guardrails.max_failures_before_page and esc_ready:
                     esc_reason = f"{kind}_failed_{fails}_times"
                     self._actuator.page_human(target, esc_reason)
+                    guardrails.last_escalated_at[key] = window.timestamp
                     actions.append(
                         PlannedAction(
                             kind=ActionKind.ESCALATE_TO_HUMAN,

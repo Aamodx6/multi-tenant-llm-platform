@@ -179,3 +179,45 @@ def test_prefetch_daemonset_wait_init_container_and_karpenter_raid0() -> None:
     rc_env = rollout_docs[2]["spec"]["template"]["spec"]["containers"][0]["env"]
     assert any(item["name"] == "CACHE_SALT_SECRET" for item in rc_env)
     assert "copy-s5cmd" in [c["name"] for c in ds_spec["initContainers"]]
+
+    # Hardened K8s checks:
+    # 1. KEDA scale-from-zero uses gateway_fallback_total trigger (not deadlocked vLLM metric)
+    keda_fb = yaml.safe_load(manifests["keda-pool-fallback.yaml"])
+    assert "gateway_fallback_total" in keda_fb["spec"]["triggers"][0]["metadata"]["query"]
+    assert keda_fb["spec"]["triggers"][0]["metadata"]["activationThreshold"] == "1"
+
+    # 2. vLLM Services exist for DNS & Prometheus scraping
+    assert "service-pool-8b.yaml" in manifests
+    svc_8b = yaml.safe_load(manifests["service-pool-8b.yaml"])
+    assert svc_8b["kind"] == "Service"
+    assert svc_8b["spec"]["ports"][0]["port"] == 8000
+
+    # 3. vLLM container mounts prefetched /models readOnly=True
+    vllm_mounts = dep_8b["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+    model_mount = next(m for m in vllm_mounts if m["name"] == "model-cache")
+    assert model_mount["readOnly"] is True
+
+    # 4. NetworkPolicy allows 443 + EKS service CIDR and protects request-control
+    netpol = yaml.safe_load(manifests["networkpolicy-inference.yaml"])
+    egress_ports = [p["port"] for rule in netpol["spec"]["egress"] for p in rule.get("ports", [])]
+    assert 443 in egress_ports
+    assert "networkpolicy-request-control.yaml" in manifests
+
+    # 5. Karpenter excludes 16Gi xlarge instances that cannot schedule 16Gi requests
+    reqs = karpenter_docs[0]["spec"]["template"]["spec"]["requirements"]
+    size_req = next(r for r in reqs if r["key"] == "karpenter.k8s.aws/instance-size")
+    assert "xlarge" not in size_req["values"]
+    assert "2xlarge" in size_req["values"]
+
+    # 6. Rollout includes probes, PSS Restricted fields, production env, and aligned replicas
+    rc_spec = rollout_docs[2]["spec"]
+    rc_container = rc_spec["template"]["spec"]["containers"][0]
+    assert rc_container["livenessProbe"]["httpGet"]["path"] == "/healthz"
+    assert rc_container["readinessProbe"]["httpGet"]["path"] == "/readyz"
+    assert rc_container["securityContext"]["capabilities"]["drop"] == ["ALL"]
+    assert rc_spec["template"]["spec"]["securityContext"]["seccompProfile"]["type"] == (
+        "RuntimeDefault"
+    )
+    assert any(item["name"] == "ENVIRONMENT" for item in rc_env)
+    assert any(item["name"] == "REDIS_URL" for item in rc_env)
+    assert rc_spec["replicas"] == 4

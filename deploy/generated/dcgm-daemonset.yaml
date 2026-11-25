@@ -58,6 +58,12 @@ spec:
         ports:
         - containerPort: 9400
           name: metrics
+        securityContext:
+          capabilities:
+            add:
+            - SYS_ADMIN
+            drop:
+            - ALL
         volumeMounts:
         - name: counters
           mountPath: /etc/dcgm-exporter/counters.csv
@@ -66,3 +72,16 @@ spec:
       - name: counters
         configMap:
           name: dcgm-counters
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dcgm-exporter
+  namespace: monitoring
+spec:
+  selector:
+    app: dcgm-exporter
+  ports:
+  - name: metrics
+    port: 9400
+    targetPort: 9400

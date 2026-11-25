@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-pool-8b
+  namespace: llm
+  labels:
+    app: vllm
+    pool: pool-8b
+spec:
+  selector:
+    app: vllm
+    pool: pool-8b
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000

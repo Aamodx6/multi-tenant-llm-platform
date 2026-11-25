@@ -26,6 +26,18 @@ def main() -> int:
     parser.add_argument("--num-requests", type=int, default=40)
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--warmup-requests", type=int, default=0)
+    parser.add_argument(
+        "--system-prompt",
+        default="You are a concise engineering assistant.",
+    )
+    parser.add_argument(
+        "--user-prompt-prefix",
+        default="Explain Kubernetes scheduling for GPU workloads",
+    )
+    parser.add_argument("--slo-p95-ttft-ms", type=float, default=1000.0)
+    parser.add_argument("--max-itl-p95-ms", type=float, default=None)
+    parser.add_argument("--min-success-rate", type=float, default=0.99)
     parser.add_argument("--gpu-hourly-usd", type=float, default=0.50)
     parser.add_argument("--baseline-json", type=Path, default=None)
     parser.add_argument("--out-json", type=Path, default=None)
@@ -39,6 +51,12 @@ def main() -> int:
         num_requests=args.num_requests,
         concurrency=args.concurrency,
         max_tokens=args.max_tokens,
+        warmup_requests=args.warmup_requests,
+        system_prompt=args.system_prompt,
+        user_prompt_prefix=args.user_prompt_prefix,
+        slo_p95_ttft_ms=args.slo_p95_ttft_ms,
+        max_itl_p95_ms=args.max_itl_p95_ms,
+        min_success_rate=args.min_success_rate,
         gpu_hourly_usd=args.gpu_hourly_usd,
     )
     baseline: BenchmarkReport | None = None

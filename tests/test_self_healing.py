@@ -266,3 +266,70 @@ def test_k8s_actuator_cordons_skips_daemonsets_and_retries_pdb_429() -> None:
     )
     with pytest.raises(RuntimeError, match="PDB"):
         adapter_strict.cordon_and_drain("gpu-node-1", "xid_error")
+
+
+def test_speedup_zscore_kv_no_restart_drain_timeout_and_escalation_cooldown() -> None:
+    # 1. Latency speedup (decrease) must NOT trigger a positive anomaly score
+    assert compute_z_score([250.0, 250.0, 250.0, 250.0, 110.0]) == 0.0
+
+    # 2. 0.96 KV usage without OOM marks pool DEGRADED but does NOT restart healthy busy pod
+    pool_health = PoolHealthStore()
+    actuator = SimulatedActuatorAdapter()
+    engine = SelfHealingEngine(actuator=actuator, pool_health=pool_health)
+    busy_plan = engine.reconcile(
+        TelemetryWindow(
+            timestamp=100.0,
+            pods=[
+                PodTelemetry(
+                    pod="vllm-busy",
+                    node="node-1",
+                    pool="pool-8b",
+                    kv_cache_usage=0.96,
+                    gpu_temp_c=72.0,
+                )
+            ],
+        ),
+        GuardrailState(),
+    )
+    busy_kinds = [(a.kind, a.target) for a in busy_plan.actions]
+    assert (ActionKind.MARK_POOL_DEGRADED, "pool-8b") in busy_kinds
+    assert (ActionKind.RESTART_POD, "vllm-busy") not in busy_kinds
+
+    # 3. Drain lock auto-clears after drain_timeout_seconds if node stops faulting or times out
+    guardrails = GuardrailState(action_cooldown_seconds=10.0, drain_timeout_seconds=120.0)
+    engine.reconcile(
+        TelemetryWindow(
+            timestamp=100.0,
+            pods=[
+                PodTelemetry("p1", "node-a", "pool-8b", 0.4, 90.0),
+                PodTelemetry("p2", "node-b", "pool-8b", 0.4, 90.0),
+            ],
+        ),
+        guardrails,
+    )
+    assert actuator.drained_nodes == ["node-a"]
+    # At t=250 (> drain_timeout_seconds=120s), stale drain lock clears -> node-b drains
+    engine.reconcile(
+        TelemetryWindow(
+            timestamp=250.0,
+            pods=[
+                PodTelemetry("p1", "node-a", "pool-8b", 0.4, 65.0),
+                PodTelemetry("p2", "node-b", "pool-8b", 0.4, 90.0),
+            ],
+        ),
+        guardrails,
+    )
+    assert "node-b" in actuator.drained_nodes
+
+    # 4. Escalation paging respects escalation_cooldown_seconds
+    fail_act = SimulatedActuatorAdapter(failing_targets={"vllm-bad"})
+    fail_engine = SelfHealingEngine(actuator=fail_act, pool_health=PoolHealthStore())
+    esc_guardrails = GuardrailState(
+        action_cooldown_seconds=5.0,
+        escalation_cooldown_seconds=300.0,
+    )
+    bad_pod = [PodTelemetry("vllm-bad", "node-x", "pool-8b", 0.99, 70.0, oom_restarts=1)]
+    fail_engine.reconcile(TelemetryWindow(timestamp=10.0, pods=bad_pod), esc_guardrails)
+    fail_engine.reconcile(TelemetryWindow(timestamp=20.0, pods=bad_pod), esc_guardrails)
+    fail_engine.reconcile(TelemetryWindow(timestamp=30.0, pods=bad_pod), esc_guardrails)
+    assert len(fail_act.paged_targets) == 1

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
@@ -22,10 +24,21 @@ from sqlalchemy import (
     text,
 )
 
+from gateway.db import normalize_database_url
 from gateway.request_control import UsageEvent
 
+_LOGGER = logging.getLogger(__name__)
 DEFAULT_STREAM_KEY = "usage:events"
 DEFAULT_GROUP_NAME = "billing-rollup"
+__all__ = [
+    "BillingRollupWorker",
+    "DEFAULT_GROUP_NAME",
+    "DEFAULT_STREAM_KEY",
+    "RedisStreamUsageSink",
+    "TENANT_USAGE_HOURLY",
+    "USAGE_EVENT_DEDUP",
+    "normalize_database_url",
+]
 
 _METADATA = MetaData()
 
@@ -50,6 +63,19 @@ TENANT_USAGE_HOURLY = Table(
     Column("updated_at", DateTime(timezone=True), nullable=False),
     PrimaryKeyConstraint("tenant_id", "pool", "lora_name", "bucket_hour"),
 )
+
+
+def _decode_stream_id(raw_id: Any) -> str:
+    return raw_id.decode("utf-8") if isinstance(raw_id, bytes) else str(raw_id)
+
+
+def _decode_stream_fields(fields: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        (k.decode("utf-8") if isinstance(k, bytes) else str(k)): (
+            v.decode("utf-8") if isinstance(v, bytes) else str(v)
+        )
+        for k, v in fields.items()
+    }
 
 
 def _event_to_fields(event: UsageEvent) -> dict[str, str]:
@@ -86,12 +112,16 @@ class RedisStreamUsageSink:
         self.stream_key = stream_key
         self._maxlen = maxlen
         self._pending_buffer: deque[dict[str, str]] = deque(maxlen=max_buffer)
+        self._lock = threading.Lock()
+        self.dropped_events_count = 0
 
     def emit(self, event: UsageEvent) -> None:
         """Append a UsageEvent to Redis Streams, buffering briefly on transient errors."""
         fields = _event_to_fields(event)
         try:
-            if self._pending_buffer:
+            with self._lock:
+                has_pending = bool(self._pending_buffer)
+            if has_pending:
                 self.flush(limit=64)
             self._redis.xadd(
                 self.stream_key,
@@ -100,15 +130,27 @@ class RedisStreamUsageSink:
                 approximate=True,
             )
         except redis.RedisError:
-            self._pending_buffer.append(fields)
+            with self._lock:
+                if (
+                    self._pending_buffer.maxlen is not None
+                    and len(self._pending_buffer) >= self._pending_buffer.maxlen
+                ):
+                    self.dropped_events_count += 1
+                    _LOGGER.warning(
+                        "Usage buffer full (%d); evicted oldest buffered event (dropped=%d).",
+                        self._pending_buffer.maxlen,
+                        self.dropped_events_count,
+                    )
+                self._pending_buffer.append(fields)
 
     def flush(self, *, limit: int | None = None) -> int:
         """Flush buffered fallback events to Redis Streams in one pipelined round-trip."""
-        pending = len(self._pending_buffer)
-        if not pending:
-            return 0
-        count = pending if limit is None else min(limit, pending)
-        batch = [self._pending_buffer[i] for i in range(count)]
+        with self._lock:
+            pending = len(self._pending_buffer)
+            if not pending:
+                return 0
+            count = pending if limit is None else min(limit, pending)
+            batch = [self._pending_buffer[i] for i in range(count)]
         pipe = self._redis.pipeline(transaction=False)
         for fields in batch:
             pipe.xadd(
@@ -118,8 +160,9 @@ class RedisStreamUsageSink:
                 approximate=True,
             )
         pipe.execute()
-        for _ in range(count):
-            self._pending_buffer.popleft()
+        with self._lock:
+            for _ in range(min(count, len(self._pending_buffer))):
+                self._pending_buffer.popleft()
         return count
 
 
@@ -134,12 +177,14 @@ class BillingRollupWorker:
         stream_key: str = DEFAULT_STREAM_KEY,
         group_name: str = DEFAULT_GROUP_NAME,
         consumer_name: str = "billing-worker-0",
+        max_deliveries: int = 5,
     ) -> None:
         self._redis = redis_client
         self._db_engine = db_engine
         self.stream_key = stream_key
         self.group_name = group_name
         self.consumer_name = consumer_name
+        self._max_deliveries = max(1, max_deliveries)
 
     def ensure_schema(self) -> None:
         """Create idempotency and hourly usage rollup tables if missing."""
@@ -173,21 +218,74 @@ class BillingRollupWorker:
             return 0
         return self._process_entries(entries)
 
-    def recover_stale(self, *, min_idle_ms: int = 60_000, count: int = 100) -> int:
-        """Reclaim abandoned pending entries via XAUTOCLAIM, persist, then XACK."""
-        self._ensure_group()
-        result = self._redis.xautoclaim(
-            name=self.stream_key,
-            groupname=self.group_name,
-            consumername=self.consumer_name,
-            min_idle_time=min_idle_ms,
-            start_id="0-0",
-            count=count,
-        )
-        claimed: list[tuple[str, Mapping[str, Any]]] = result[1] if result else []
+    def _quarantine_poison_pills(
+        self, claimed: Sequence[tuple[str, Mapping[str, Any] | None]]
+    ) -> list[tuple[str, Mapping[str, Any] | None]]:
         if not claimed:
-            return 0
-        return self._process_entries(claimed)
+            return []
+        healthy: list[tuple[str, Mapping[str, Any] | None]] = []
+        dlq_key = f"{self.stream_key}:dlq"
+        for raw_id, fields in claimed:
+            msg_id = _decode_stream_id(raw_id)
+            deliveries = 0
+            try:
+                pending_info = self._redis.xpending_range(
+                    self.stream_key,
+                    self.group_name,
+                    min=msg_id,
+                    max=msg_id,
+                    count=1,
+                )
+                if pending_info:
+                    deliveries = int(pending_info[0].get("times_delivered", 0))
+            except redis.RedisError:
+                deliveries = 0
+
+            if deliveries >= self._max_deliveries:
+                dlq_fields: dict[str, str] = {"original_id": msg_id, "deliveries": str(deliveries)}
+                if fields:
+                    dlq_fields.update(_decode_stream_fields(fields))
+                self._redis.xadd(dlq_key, dlq_fields, maxlen=100_000, approximate=True)  # type: ignore[arg-type]
+                self._redis.xack(self.stream_key, self.group_name, msg_id)
+                _LOGGER.warning(
+                    "Quarantined poison-pill usage event %s after %d deliveries to %s",
+                    msg_id,
+                    deliveries,
+                    dlq_key,
+                )
+            else:
+                healthy.append((raw_id, fields))
+        return healthy
+
+    def recover_stale(self, *, min_idle_ms: int = 60_000, count: int = 100) -> int:
+        """Reclaim abandoned pending entries via XAUTOCLAIM cursor, DLQ poison pills, and XACK."""
+        self._ensure_group()
+        total_processed = 0
+        cursor = "0-0"
+        while True:
+            result = self._redis.xautoclaim(
+                name=self.stream_key,
+                groupname=self.group_name,
+                consumername=self.consumer_name,
+                min_idle_time=min_idle_ms,
+                start_id=cursor,
+                count=count,
+            )
+            if not result:
+                break
+            next_cursor = result[0]
+            claimed: list[tuple[str, Mapping[str, Any] | None]] = result[1] or []
+            if claimed:
+                healthy = self._quarantine_poison_pills(claimed)
+                if healthy:
+                    total_processed += self._process_entries(healthy)
+            cursor_str = (
+                next_cursor.decode("utf-8") if isinstance(next_cursor, bytes) else str(next_cursor)
+            )
+            if not claimed or cursor_str == "0-0" or cursor_str == cursor:
+                break
+            cursor = cursor_str
+        return total_processed
 
     def _flatten_xreadgroup(self, response: Any) -> list[tuple[str, Mapping[str, Any]]]:
         if not response:
@@ -203,16 +301,11 @@ class BillingRollupWorker:
         now = datetime.now(tz=UTC)
 
         for raw_id, fields in entries:
-            msg_id = raw_id.decode("utf-8") if isinstance(raw_id, bytes) else str(raw_id)
+            msg_id = _decode_stream_id(raw_id)
             message_ids.append(msg_id)
             if fields is None:
                 continue
-            decoded = {
-                (k.decode("utf-8") if isinstance(k, bytes) else str(k)): (
-                    v.decode("utf-8") if isinstance(v, bytes) else str(v)
-                )
-                for k, v in fields.items()
-            }
+            decoded = _decode_stream_fields(fields)
             try:
                 dedup_id = decoded.get("event_id") or decoded["trace_id"]
                 ts_ms = int(decoded.get("recorded_at_ms", "0") or 0)
@@ -240,18 +333,28 @@ class BillingRollupWorker:
 
         dedup_count = 0
         with self._db_engine.begin() as conn:
-            accepted: list[dict[str, Any]] = []
+            ordered = sorted(parsed_events, key=lambda row: str(row["trace_id"]))
+            # Deduplicate within the batch first so multi-row VALUES inserts cleanly
+            unique_by_id: dict[str, dict[str, Any]] = {}
+            for item in ordered:
+                unique_by_id.setdefault(str(item["trace_id"]), item)
+            unique_items = list(unique_by_id.values())
+
+            placeholders = ", ".join(
+                f"(:tid_{idx}, :created_at)" for idx in range(len(unique_items))
+            )
+            params: dict[str, Any] = {"created_at": now}
+            for idx, item in enumerate(unique_items):
+                params[f"tid_{idx}"] = item["trace_id"]
             dedup_stmt = text(
-                "INSERT INTO usage_event_dedup (trace_id, created_at) "
-                "VALUES (:trace_id, :created_at) "
+                f"INSERT INTO usage_event_dedup (trace_id, created_at) "
+                f"VALUES {placeholders} "
                 "ON CONFLICT (trace_id) DO NOTHING RETURNING trace_id"
             ).bindparams(bindparam("created_at", type_=DateTime(timezone=True)))
-            for item in sorted(parsed_events, key=lambda row: str(row["trace_id"])):
-                inserted = conn.execute(
-                    dedup_stmt, {"trace_id": item["trace_id"], "created_at": now}
-                ).fetchone()
-                if inserted is not None:
-                    accepted.append(item)
+            inserted_ids = {
+                str(row[0]) for row in conn.execute(dedup_stmt, params).fetchall()
+            }
+            accepted = [item for item in unique_items if str(item["trace_id"]) in inserted_ids]
 
             dedup_count = len(accepted)
             if accepted:
@@ -318,10 +421,15 @@ class BillingRollupWorker:
 def main() -> int:
     """Run the Redis Streams -> Postgres hourly billing worker until interrupted."""
     redis_url = os.environ["REDIS_URL"]
-    database_url = os.environ["DATABASE_URL"]
+    database_url = normalize_database_url(os.environ["DATABASE_URL"])
     consumer = os.environ.get("HOSTNAME", "billing-worker-0")
 
-    redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
+    redis_client = redis.Redis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=1.0,
+        socket_timeout=5.0,
+    )
     db_engine = create_engine(database_url, pool_pre_ping=True)
     worker = BillingRollupWorker(
         redis_client=redis_client,

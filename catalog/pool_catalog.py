@@ -1,11 +1,28 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+
+_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+_SAFE_S3_URI_RE = re.compile(r"^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/[A-Za-z0-9._/@+=,-]+$")
+_SAFE_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+
+
+def _validate_safe_name(value: str, label: str) -> str:
+    if ".." in value or not _SAFE_NAME_RE.fullmatch(value):
+        raise ValueError(f"{label} '{value}' contains invalid or unsafe path characters")
+    return value
+
+
+def _validate_s3_uri(value: str) -> str:
+    if ".." in value.split("/") or not _SAFE_S3_URI_RE.fullmatch(value):
+        raise ValueError(f"Invalid or unsafe s3_uri '{value}'")
+    return value
 
 
 def model_slug(model_id: str) -> str:
@@ -33,6 +50,16 @@ class LoraAdapterSpec(BaseModel):
     s3_uri: str
     rank: int = Field(default=16, ge=1)
     dynamic: bool = True
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        return _validate_safe_name(value, "LoRA name")
+
+    @field_validator("s3_uri")
+    @classmethod
+    def _check_s3_uri(cls, value: str) -> str:
+        return _validate_s3_uri(value)
 
 
 class ModelPoolSpec(BaseModel):
@@ -65,6 +92,25 @@ class ModelPoolSpec(BaseModel):
     slo_p95_ttft_ms: int = Field(gt=0)
     slo_availability: float = Field(gt=0.0, le=1.0)
     aliases: list[str] = Field(default_factory=list)
+
+    @field_validator("name")
+    @classmethod
+    def _check_pool_name(cls, value: str) -> str:
+        return _validate_safe_name(value, "Pool name")
+
+    @field_validator("model_id")
+    @classmethod
+    def _check_model_id(cls, value: str) -> str:
+        if ".." in value.split("/") or not _SAFE_MODEL_ID_RE.fullmatch(value):
+            raise ValueError(f"Invalid or unsafe model_id '{value}'")
+        return value
+
+    @field_validator("prefetch_uri")
+    @classmethod
+    def _check_prefetch_uri(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _validate_s3_uri(value)
 
     @model_validator(mode="after")
     def _validate_pool_invariants(self) -> ModelPoolSpec:

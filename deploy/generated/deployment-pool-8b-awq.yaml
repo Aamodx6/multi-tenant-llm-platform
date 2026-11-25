@@ -19,6 +19,9 @@ spec:
         pool: pool-8b-awq
     spec:
       terminationGracePeriodSeconds: 180
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       nodeSelector:
         nvidia.com/gpu.present: 'true'
       tolerations:
@@ -59,6 +62,7 @@ spec:
           mountPath: /dev/shm
         - name: model-cache
           mountPath: /models
+          readOnly: true
         startupProbe:
           httpGet:
             path: /health
@@ -78,6 +82,11 @@ spec:
               - /bin/sh
               - -c
               - sleep 15
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
       volumes:
       - name: dshm
         emptyDir:

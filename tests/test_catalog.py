@@ -231,3 +231,52 @@ pools:
     idx = args.index("--prefix-caching-hash-algo")
     assert args[idx + 1] == "sha256"
     assert cat.pools["pool-8b"].isolate_prefix_cache is True
+
+
+def test_rejects_path_traversal_and_shell_metacharacters_in_catalog() -> None:
+    bad_lora_name = """
+pools:
+  pool-8b:
+    model_id: Qwen/Qwen2.5-7B-Instruct
+    enable_lora: true
+    min_replicas: 1
+    max_replicas: 2
+    keda_waiting_threshold: 4
+    keda_kv_cache_threshold: 0.8
+    slo_p95_ttft_ms: 1000
+    slo_availability: 0.995
+    loras:
+      - name: ../../other-pool/secret
+        s3_uri: s3://models/loras/good
+"""
+    with pytest.raises(CatalogValidationError):
+        load_and_validate(bad_lora_name)
+
+    bad_s3_uri = """
+pools:
+  pool-8b:
+    model_id: Qwen/Qwen2.5-7B-Instruct
+    prefetch_uri: "s3://models/qwen; rm -rf /"
+    min_replicas: 1
+    max_replicas: 2
+    keda_waiting_threshold: 4
+    keda_kv_cache_threshold: 0.8
+    slo_p95_ttft_ms: 1000
+    slo_availability: 0.995
+"""
+    with pytest.raises(CatalogValidationError):
+        load_and_validate(bad_s3_uri)
+
+    bad_pool_name = """
+pools:
+  "pool$(id)":
+    model_id: Qwen/Qwen2.5-7B-Instruct
+    min_replicas: 1
+    max_replicas: 2
+    keda_waiting_threshold: 4
+    keda_kv_cache_threshold: 0.8
+    slo_p95_ttft_ms: 1000
+    slo_availability: 0.995
+"""
+    with pytest.raises(CatalogValidationError):
+        load_and_validate(bad_pool_name)

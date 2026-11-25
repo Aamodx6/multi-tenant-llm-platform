@@ -14,10 +14,16 @@ spec:
   - type: prometheus
     metadata:
       serverAddress: http://prometheus-operated.monitoring:9090
+      metricName: gateway_fallback_demand
+      query: sum(increase(gateway_fallback_total{to_pool="pool-fallback"}[2m]))
+      threshold: '1'
+      activationThreshold: '1'
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-operated.monitoring:9090
       metricName: vllm_requests_waiting
       query: sum(vllm:num_requests_waiting{model_name="Qwen/Qwen2.5-1.5B-Instruct"})
       threshold: '6'
-      activationThreshold: '1'
   - type: prometheus
     metadata:
       serverAddress: http://prometheus-operated.monitoring:9090

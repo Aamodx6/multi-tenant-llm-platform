@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -138,37 +139,41 @@ class PoolHealthStore:
         self._unhealthy_threshold = unhealthy_failure_threshold
         self._now = now_fn
         self._records: dict[str, _PoolRecord] = {}
+        self._lock = threading.Lock()
 
     def get_state(self, pool: str) -> PoolStatus:
         """Return current PoolStatus, auto-expiring TTL-only degraded overrides."""
-        rec = self._records.get(pool)
-        if rec is None:
-            return PoolStatus(pool=pool, state=HealthState.HEALTHY)
-        status, _ = _status_for(pool, rec, self._now())
-        return status
+        with self._lock:
+            rec = self._records.get(pool)
+            if rec is None:
+                return PoolStatus(pool=pool, state=HealthState.HEALTHY)
+            status, _ = _status_for(pool, rec, self._now())
+            return status
 
     def set_degraded(self, pool: str, reason: str, ttl_seconds: float) -> PoolStatus:
         """Mark a pool degraded for ttl_seconds without mutating deployment args."""
-        now = self._now()
-        rec = self._records.setdefault(pool, _PoolRecord())
-        _apply_degraded(rec, reason, ttl_seconds, now)
-        status, _ = _status_for(pool, rec, now)
-        return status
+        with self._lock:
+            now = self._now()
+            rec = self._records.setdefault(pool, _PoolRecord())
+            _apply_degraded(rec, reason, ttl_seconds, now)
+            status, _ = _status_for(pool, rec, now)
+            return status
 
     def record_probe(self, pool: str, *, ok: bool) -> PoolStatus:
         """Record an engine health probe and apply hysteresis before recovering."""
-        now = self._now()
-        rec = self._records.setdefault(pool, _PoolRecord())
-        _apply_probe(
-            rec,
-            ok=ok,
-            now=now,
-            recovery_cooldown=self._recovery_cooldown,
-            min_healthy_probes=self._min_healthy_probes,
-            unhealthy_threshold=self._unhealthy_threshold,
-        )
-        status, _ = _status_for(pool, rec, now)
-        return status
+        with self._lock:
+            now = self._now()
+            rec = self._records.setdefault(pool, _PoolRecord())
+            _apply_probe(
+                rec,
+                ok=ok,
+                now=now,
+                recovery_cooldown=self._recovery_cooldown,
+                min_healthy_probes=self._min_healthy_probes,
+                unhealthy_threshold=self._unhealthy_threshold,
+            )
+            status, _ = _status_for(pool, rec, now)
+            return status
 
 
 _HEALTH_LUA_TIME = """

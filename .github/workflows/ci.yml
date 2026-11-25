@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pytest mypy ruff fakeredis
+      - name: Lint with ruff
+        run: python -m ruff check .
+      - name: Typecheck with mypy
+        run: python -m mypy .
+      - name: Run unit & seam tests
+        run: python -m pytest -v
+      - name: Verify generated manifests are up to date
+        run: |
+          python -m deploy.render_all --catalog catalog/pools.yaml --out-dir deploy/generated --use-prefetched-weights
+          git diff --exit-code deploy/generated

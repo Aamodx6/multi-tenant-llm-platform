@@ -30,7 +30,7 @@ metadata:
   name: request-control
   namespace: llm
 spec:
-  replicas: 2
+  replicas: 4
   selector:
     matchLabels:
       app: request-control
@@ -39,10 +39,10 @@ spec:
       canaryService: request-control-canary
       stableService: request-control-stable
       steps:
-      - setWeight: 5
+      - setWeight: 25
       - pause:
           duration: 2m
-      - setWeight: 25
+      - setWeight: 50
       - analysis:
           templates:
           - templateName: request-control-ttft-slo
@@ -52,22 +52,61 @@ spec:
       labels:
         app: request-control
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: request-control
         image: ghcr.io/multi-tenant-llm/request-control:latest
         ports:
         - containerPort: 8080
         env:
+        - name: ENVIRONMENT
+          value: production
+        - name: GATEWAY_REPLICAS
+          value: '4'
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: request-control-secrets
+              key: redis-url
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: request-control-secrets
+              key: database-url
         - name: CACHE_SALT_SECRET
           valueFrom:
             secretKeyRef:
               name: request-control-secrets
               key: cache-salt-secret
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: '2'
+            memory: 1Gi
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+          periodSeconds: 5
         securityContext:
           runAsNonRoot: true
           runAsUser: 10001
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: AnalysisTemplate
@@ -76,12 +115,30 @@ metadata:
   namespace: llm
 spec:
   metrics:
-  - name: p95-ttft-slo
+  - name: p95-ttft-slo-pool-fallback
     interval: 30s
     count: 4
     successCondition: result[0] <= 0.600
     provider:
       prometheus:
         address: http://prometheus-operated.monitoring:9090
-        query: histogram_quantile(0.95, sum(rate(gateway_ttft_seconds_bucket[2m]))
+        query: histogram_quantile(0.95, sum(rate(gateway_ttft_seconds_bucket{pool="pool-fallback"}[2m]))
+          by (le))
+  - name: p95-ttft-slo-pool-8b
+    interval: 30s
+    count: 4
+    successCondition: result[0] <= 1.000
+    provider:
+      prometheus:
+        address: http://prometheus-operated.monitoring:9090
+        query: histogram_quantile(0.95, sum(rate(gateway_ttft_seconds_bucket{pool="pool-8b"}[2m]))
+          by (le))
+  - name: p95-ttft-slo-pool-8b-awq
+    interval: 30s
+    count: 4
+    successCondition: result[0] <= 1.000
+    provider:
+      prometheus:
+        address: http://prometheus-operated.monitoring:9090
+        query: histogram_quantile(0.95, sum(rate(gateway_ttft_seconds_bucket{pool="pool-8b-awq"}[2m]))
           by (le))

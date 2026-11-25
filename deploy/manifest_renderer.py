@@ -20,6 +20,7 @@ class DeployConfig(BaseModel):
     model_bucket_name: str = "llm-model-weights"
     prefetch_service_account: str = "weight-prefetcher"
     use_prefetched_weights: bool = False
+    app_secret_name: str = "request-control-secrets"
     cache_salt_secret_name: str = "request-control-secrets"
     cache_salt_secret_key: str = "cache-salt-secret"
     cluster_name: str = "llm-prod-eks"
@@ -45,6 +46,9 @@ def render_deploy_manifests(
         out[f"deployment-{name}.yaml"] = yaml.safe_dump(
             _vllm_deployment(name, spec, args, cfg), sort_keys=False
         )
+        out[f"service-{name}.yaml"] = yaml.safe_dump(
+            _vllm_service(name, cfg), sort_keys=False
+        )
         out[f"keda-{name}.yaml"] = yaml.safe_dump(
             _keda_scaled_object(name, spec.model_id, keda_cfg, cfg), sort_keys=False
         )
@@ -58,16 +62,18 @@ def render_deploy_manifests(
     out["networkpolicy-inference.yaml"] = yaml.safe_dump(
         _inference_network_policy(cfg), sort_keys=False
     )
+    out["networkpolicy-request-control.yaml"] = yaml.safe_dump(
+        _request_control_network_policy(cfg), sort_keys=False
+    )
     out["karpenter-gpu.yaml"] = yaml.safe_dump_all(
         [_karpenter_nodepool(cfg), _karpenter_nodeclass(cfg)], sort_keys=False
     )
-    ttft_slo_seconds = min(float(v["p95_ttft_ms"]) for v in slo_map.values()) / 1000.0
     out["rollout-request-control.yaml"] = yaml.safe_dump_all(
         [
             _request_control_service("request-control-stable", cfg),
             _request_control_service("request-control-canary", cfg),
             _request_control_rollout(cfg),
-            _ttft_analysis_template(ttft_slo_seconds, cfg),
+            _ttft_analysis_template(slo_map, cfg),
         ],
         sort_keys=False,
     )
@@ -126,7 +132,11 @@ def _vllm_deployment(
         },
         "volumeMounts": [
             {"name": "dshm", "mountPath": "/dev/shm"},
-            {"name": "model-cache", "mountPath": "/models"},
+            {
+                "name": "model-cache",
+                "mountPath": "/models",
+                "readOnly": cfg.use_prefetched_weights,
+            },
         ],
         "startupProbe": {
             "httpGet": {"path": "/health", "port": 8000},
@@ -141,12 +151,17 @@ def _vllm_deployment(
         "lifecycle": {
             "preStop": {"exec": {"command": ["/bin/sh", "-c", "sleep 15"]}}
         },
+        "securityContext": {
+            "allowPrivilegeEscalation": False,
+            "capabilities": {"drop": ["ALL"]},
+        },
     }
     if env_vars:
         container["env"] = env_vars
 
     pod_spec: dict[str, Any] = {
         "terminationGracePeriodSeconds": 180,
+        "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}},
         "nodeSelector": {"nvidia.com/gpu.present": "true"},
         "tolerations": [
             {
@@ -186,6 +201,22 @@ def _vllm_deployment(
     }
 
 
+def _vllm_service(name: str, cfg: DeployConfig) -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": f"vllm-{name}",
+            "namespace": cfg.namespace,
+            "labels": {"app": "vllm", "pool": name},
+        },
+        "spec": {
+            "selector": {"app": "vllm", "pool": name},
+            "ports": [{"name": "http", "port": 8000, "targetPort": 8000}],
+        },
+    }
+
+
 def _keda_scaled_object(
     name: str,
     model_id: str,
@@ -198,8 +229,34 @@ def _keda_scaled_object(
         "query": f'sum(vllm:num_requests_waiting{{model_name="{model_id}"}})',
         "threshold": str(keda_cfg["waiting_threshold"]),
     }
+    triggers: list[dict[str, Any]] = []
     if int(keda_cfg["min_replicas"]) == 0:
-        waiting_meta["activationThreshold"] = "1"
+        triggers.append(
+            {
+                "type": "prometheus",
+                "metadata": {
+                    "serverAddress": cfg.prometheus_url,
+                    "metricName": "gateway_fallback_demand",
+                    "query": f'sum(increase(gateway_fallback_total{{to_pool="{name}"}}[2m]))',
+                    "threshold": "1",
+                    "activationThreshold": "1",
+                },
+            }
+        )
+    triggers.extend(
+        [
+            {"type": "prometheus", "metadata": waiting_meta},
+            {
+                "type": "prometheus",
+                "metadata": {
+                    "serverAddress": cfg.prometheus_url,
+                    "metricName": "vllm_kv_cache_usage",
+                    "query": f'avg(vllm:kv_cache_usage_perc{{model_name="{model_id}"}})',
+                    "threshold": f"{float(keda_cfg['kv_cache_threshold']):.2f}",
+                },
+            },
+        ]
+    )
 
     return {
         "apiVersion": "keda.sh/v1alpha1",
@@ -211,18 +268,7 @@ def _keda_scaled_object(
             "cooldownPeriod": 300,
             "minReplicaCount": int(keda_cfg["min_replicas"]),
             "maxReplicaCount": int(keda_cfg["max_replicas"]),
-            "triggers": [
-                {"type": "prometheus", "metadata": waiting_meta},
-                {
-                    "type": "prometheus",
-                    "metadata": {
-                        "serverAddress": cfg.prometheus_url,
-                        "metricName": "vllm_kv_cache_usage",
-                        "query": f'avg(vllm:kv_cache_usage_perc{{model_name="{model_id}"}})',
-                        "threshold": f"{float(keda_cfg['kv_cache_threshold']):.2f}",
-                    },
-                },
-            ],
+            "triggers": triggers,
         },
     }
 
@@ -259,7 +305,56 @@ def _inference_network_policy(cfg: DeployConfig) -> dict[str, Any]:
             ],
             "egress": [
                 {"ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]},
+                {
+                    "to": [
+                        {
+                            "ipBlock": {
+                                "cidr": "0.0.0.0/0",
+                                "except": [
+                                    "10.0.0.0/8",
+                                    "172.16.0.0/12",
+                                    "192.168.0.0/16",
+                                    "169.254.0.0/16",
+                                ],
+                            }
+                        }
+                    ],
+                    "ports": [{"protocol": "TCP", "port": 443}],
+                },
                 {"to": [{"ipBlock": {"cidr": "10.0.0.0/8"}}]},
+                {"to": [{"ipBlock": {"cidr": "172.20.0.0/16"}}]},
+            ],
+        },
+    }
+
+
+def _request_control_network_policy(cfg: DeployConfig) -> dict[str, Any]:
+    return {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {"name": "request-control-isolation", "namespace": cfg.namespace},
+        "spec": {
+            "podSelector": {"matchLabels": {"app": "request-control"}},
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": [
+                {"ports": [{"protocol": "TCP", "port": 8080}]},
+            ],
+            "egress": [
+                {"ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]},
+                {
+                    "to": [{"podSelector": {"matchLabels": {"app": "vllm"}}}],
+                    "ports": [{"protocol": "TCP", "port": 8000}],
+                },
+                {
+                    "to": [
+                        {"ipBlock": {"cidr": "10.0.0.0/8"}},
+                        {"ipBlock": {"cidr": "172.20.0.0/16"}},
+                    ],
+                    "ports": [
+                        {"protocol": "TCP", "port": 6379},
+                        {"protocol": "TCP", "port": 5432},
+                    ],
+                },
             ],
         },
     }
@@ -287,6 +382,11 @@ def _karpenter_nodepool(cfg: DeployConfig) -> dict[str, Any]:
                             "key": "karpenter.k8s.aws/instance-family",
                             "operator": "In",
                             "values": list(cfg.spot_instance_families),
+                        },
+                        {
+                            "key": "karpenter.k8s.aws/instance-size",
+                            "operator": "In",
+                            "values": ["2xlarge", "4xlarge"],
                         },
                     ],
                     "nodeClassRef": {
@@ -364,29 +464,34 @@ def _weight_prefetch_daemonset(
                 )
             )
 
-    sync_commands = " && ".join(
-        (
-            f"(mkdir -p /models/.locks /models/.staging && "
-            f"lock_name=$(printf '%s' '{rel}' | tr '/' '_') && "
-            f'flock "/models/.locks/${{lock_name}}.lock" /bin/sh -c \''
-            f"if [ ! -f /models/{rel}/.ready ]; then "
-            f'stage="/models/.staging/${{lock_name}}.$$"; '
-            f'trap "rm -rf \\"$stage\\"" EXIT; '
-            f'mkdir -p "$stage" && '
-            f'/tools/s5cmd cp --concurrency 32 "{uri}/*" "$stage/" && '
-            f'(ls "$stage"/*.safetensors >/dev/null 2>&1 || '
-            f'ls "$stage"/adapter_model* >/dev/null 2>&1) && '
-            f'touch "$stage/.ready" && '
-            f'mkdir -p "$(dirname /models/{rel})" && '
-            f'rm -rf "/models/{rel}.old" && '
-            f'([ ! -e "/models/{rel}" ] || mv "/models/{rel}" "/models/{rel}.old") && '
-            f'mv "$stage" "/models/{rel}" && '
-            f'rm -rf "/models/{rel}.old" && '
-            f"trap - EXIT; fi')"
-        )
-        for rel, uri in sync_entries
+    sync_manifest = "\n".join(f"{rel}\t{uri}" for rel, uri in sync_entries)
+    prefetch_script = (
+        "set -eu\n"
+        "mkdir -p /models/.locks /models/.staging\n"
+        'printf "%s\\n" "$PREFETCH_TARGETS" | while IFS="$(printf \'\\t\')" read -r rel uri; do\n'
+        '  [ -n "$rel" ] || continue\n'
+        '  lock_name=$(printf "%s" "$rel" | tr "/" "_")\n'
+        '  flock "/models/.locks/${lock_name}.lock" /bin/sh -c \'\n'
+        '    rel="$1"; uri="$2"; lock_name="$3"\n'
+        '    if [ ! -f "/models/${rel}/.ready" ]; then\n'
+        '      stage="/models/.staging/${lock_name}.$$"\n'
+        '      trap "rm -rf \\"$stage\\"" EXIT\n'
+        '      mkdir -p "$stage"\n'
+        '      /tools/s5cmd cp --concurrency 32 "${uri}/*" "$stage/"\n'
+        '      (ls "$stage"/*.safetensors >/dev/null 2>&1 || '
+        'ls "$stage"/adapter_model* >/dev/null 2>&1)\n'
+        '      touch "$stage/.ready"\n'
+        '      mkdir -p "$(dirname "/models/${rel}")"\n'
+        '      rm -rf "/models/${rel}.old"\n'
+        '      ([ ! -e "/models/${rel}" ] || mv "/models/${rel}" "/models/${rel}.old")\n'
+        '      mv "$stage" "/models/${rel}"\n'
+        '      rm -rf "/models/${rel}.old"\n'
+        '      trap - EXIT\n'
+        '    fi\n'
+        "  ' sh \"$rel\" \"$uri\" \"$lock_name\"\n"
+        "done\n"
+        "exec sleep infinity"
     )
-    script = f"set -eu; {sync_commands or 'true'}; exec sleep infinity"
     return {
         "apiVersion": "apps/v1",
         "kind": "DaemonSet",
@@ -401,6 +506,7 @@ def _weight_prefetch_daemonset(
                 "metadata": {"labels": {"app": "weight-prefetch"}},
                 "spec": {
                     "serviceAccountName": cfg.prefetch_service_account,
+                    "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}},
                     "nodeSelector": {"nvidia.com/gpu.present": "true"},
                     "tolerations": [
                         {
@@ -414,6 +520,10 @@ def _weight_prefetch_daemonset(
                             "name": "copy-s5cmd",
                             "image": cfg.s5cmd_image,
                             "command": ["cp", "/s5cmd", "/tools/s5cmd"],
+                            "securityContext": {
+                                "allowPrivilegeEscalation": False,
+                                "capabilities": {"drop": ["ALL"]},
+                            },
                             "volumeMounts": [{"name": "tools", "mountPath": "/tools"}],
                         }
                     ],
@@ -421,7 +531,12 @@ def _weight_prefetch_daemonset(
                         {
                             "name": "s5cmd-prefetch",
                             "image": "alpine:3.20",
-                            "command": ["/bin/sh", "-c", script],
+                            "command": ["/bin/sh", "-c", prefetch_script],
+                            "env": [{"name": "PREFETCH_TARGETS", "value": sync_manifest}],
+                            "securityContext": {
+                                "allowPrivilegeEscalation": False,
+                                "capabilities": {"drop": ["ALL"]},
+                            },
                             "volumeMounts": [
                                 {"name": "model-cache", "mountPath": "/models"},
                                 {"name": "tools", "mountPath": "/tools"},
@@ -459,16 +574,16 @@ def _request_control_rollout(cfg: DeployConfig) -> dict[str, Any]:
         "kind": "Rollout",
         "metadata": {"name": "request-control", "namespace": cfg.namespace},
         "spec": {
-            "replicas": 2,
+            "replicas": 4,
             "selector": {"matchLabels": {"app": "request-control"}},
             "strategy": {
                 "canary": {
                     "canaryService": "request-control-canary",
                     "stableService": "request-control-stable",
                     "steps": [
-                        {"setWeight": 5},
-                        {"pause": {"duration": "2m"}},
                         {"setWeight": 25},
+                        {"pause": {"duration": "2m"}},
+                        {"setWeight": 50},
                         {
                             "analysis": {
                                 "templates": [{"templateName": "request-control-ttft-slo"}]
@@ -481,12 +596,37 @@ def _request_control_rollout(cfg: DeployConfig) -> dict[str, Any]:
             "template": {
                 "metadata": {"labels": {"app": "request-control"}},
                 "spec": {
+                    "securityContext": {
+                        "runAsNonRoot": True,
+                        "runAsUser": 10001,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
                     "containers": [
                         {
                             "name": "request-control",
                             "image": cfg.request_control_image,
                             "ports": [{"containerPort": 8080}],
                             "env": [
+                                {"name": "ENVIRONMENT", "value": "production"},
+                                {"name": "GATEWAY_REPLICAS", "value": "4"},
+                                {
+                                    "name": "REDIS_URL",
+                                    "valueFrom": {
+                                        "secretKeyRef": {
+                                            "name": cfg.app_secret_name,
+                                            "key": "redis-url",
+                                        }
+                                    },
+                                },
+                                {
+                                    "name": "DATABASE_URL",
+                                    "valueFrom": {
+                                        "secretKeyRef": {
+                                            "name": cfg.app_secret_name,
+                                            "key": "database-url",
+                                        }
+                                    },
+                                },
                                 {
                                     "name": "CACHE_SALT_SECRET",
                                     "valueFrom": {
@@ -495,44 +635,66 @@ def _request_control_rollout(cfg: DeployConfig) -> dict[str, Any]:
                                             "key": cfg.cache_salt_secret_key,
                                         }
                                     },
-                                }
+                                },
                             ],
+                            "resources": {
+                                "requests": {"cpu": "500m", "memory": "512Mi"},
+                                "limits": {"cpu": "2", "memory": "1Gi"},
+                            },
+                            "livenessProbe": {
+                                "httpGet": {"path": "/healthz", "port": 8080},
+                                "periodSeconds": 10,
+                            },
+                            "readinessProbe": {
+                                "httpGet": {"path": "/readyz", "port": 8080},
+                                "periodSeconds": 5,
+                            },
                             "securityContext": {
                                 "runAsNonRoot": True,
                                 "runAsUser": 10001,
                                 "allowPrivilegeEscalation": False,
                                 "readOnlyRootFilesystem": True,
+                                "capabilities": {"drop": ["ALL"]},
                             },
                         }
-                    ]
+                    ],
                 },
             },
         },
     }
 
 
-def _ttft_analysis_template(ttft_slo_seconds: float, cfg: DeployConfig) -> dict[str, Any]:
+def _ttft_analysis_template(
+    slo_map: dict[str, dict[str, Any]], cfg: DeployConfig
+) -> dict[str, Any]:
+    ordered = sorted(
+        slo_map.items(),
+        key=lambda item: (float(item[1]["p95_ttft_ms"]), item[0]),
+    )
+    metrics: list[dict[str, Any]] = []
+    for pool_name, slo_cfg in ordered:
+        ttft_sec = float(slo_cfg["p95_ttft_ms"]) / 1000.0
+        metrics.append(
+            {
+                "name": f"p95-ttft-slo-{pool_name}",
+                "interval": "30s",
+                "count": 4,
+                "successCondition": f"result[0] <= {ttft_sec:.3f}",
+                "provider": {
+                    "prometheus": {
+                        "address": cfg.prometheus_url,
+                        "query": (
+                            f'histogram_quantile(0.95, '
+                            f'sum(rate(gateway_ttft_seconds_bucket{{pool="{pool_name}"}}[2m])) '
+                            f"by (le))"
+                        ),
+                    }
+                },
+            }
+        )
     return {
         "apiVersion": "argoproj.io/v1alpha1",
         "kind": "AnalysisTemplate",
         "metadata": {"name": "request-control-ttft-slo", "namespace": cfg.namespace},
-        "spec": {
-            "metrics": [
-                {
-                    "name": "p95-ttft-slo",
-                    "interval": "30s",
-                    "count": 4,
-                    "successCondition": f"result[0] <= {ttft_slo_seconds:.3f}",
-                    "provider": {
-                        "prometheus": {
-                            "address": cfg.prometheus_url,
-                            "query": (
-                                "histogram_quantile(0.95, "
-                                "sum(rate(gateway_ttft_seconds_bucket[2m])) by (le))"
-                            ),
-                        }
-                    },
-                }
-            ]
-        },
+        "spec": {"metrics": metrics},
     }

@@ -6,6 +6,7 @@ import hashlib
 import heapq
 import hmac
 import json
+import logging
 import math
 import re
 import secrets
@@ -35,7 +36,9 @@ from gateway.tenant_budget import (
 )
 from observability.metrics import MetricsRegistry
 
+_LOGGER = logging.getLogger(__name__)
 _VNODE_COUNT = 64
+_TRACE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{8,64}$")
 _PROM_METRIC_RE = re.compile(
     r"^(vllm:(?:num_requests_waiting|kv_cache_usage_perc))(?:\{[^}]*\})?\s+([0-9eE.+_-]+)$"
 )
@@ -44,22 +47,38 @@ _PROM_METRIC_RE = re.compile(
 class ChatMessage(BaseModel):
     """OpenAI-compatible chat message."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
-    role: str
-    content: str
+    role: str = Field(min_length=1, max_length=32)
+    content: str | list[dict[str, Any]] | None = None
+    name: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
-    """OpenAI-compatible chat completion request payload."""
+    """OpenAI-compatible chat completion request payload with strict field allowlist."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
-    model: str
-    messages: list[ChatMessage]
-    max_tokens: int = Field(default=256, ge=1, le=32768)
+    model: str = Field(min_length=1, max_length=256)
+    messages: list[ChatMessage] = Field(min_length=1)
+    max_tokens: int | None = Field(default=None, ge=1, le=32768)
+    max_completion_tokens: int | None = Field(default=None, ge=1, le=32768)
+    n: int = Field(default=1, ge=1, le=1)
     stream: bool = False
     stream_options: dict[str, Any] | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
+    stop: str | list[str] | None = None
+    presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    frequency_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    seed: int | None = None
+    user: str | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    response_format: dict[str, Any] | None = None
+    cache_salt: str | None = None
 
 
 @dataclass
@@ -80,6 +99,9 @@ class EngineResult:
     prompt_tokens: int
     completion_tokens: int
     replica_id: str
+    finish_reason: str = "stop"
+    tool_calls: list[dict[str, Any]] | None = None
+    reasoning_content: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +114,9 @@ class StreamChunk:
     finished: bool = False
     role: str | None = None
     is_usage_only: bool = False
+    finish_reason: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    reasoning_content: str | None = None
 
 
 class InferenceEngine(Protocol):
@@ -124,6 +149,8 @@ class InferenceEngine(Protocol):
     async def ensure_lora_loaded(
         self, *, replica: ReplicaEndpoint, lora_name: str, lora_path: str
     ) -> None: ...
+
+    def has_lora(self, replica_id: str, lora_name: str) -> bool: ...
 
 
 class AdmissionPolicy(BaseModel):
@@ -273,6 +300,9 @@ class FakeEngineAdapter:
         _ = lora_path
         self.loaded_loras.add((replica.replica_id, lora_name))
 
+    def has_lora(self, replica_id: str, lora_name: str) -> bool:
+        return (replica_id, lora_name) in self.loaded_loras
+
 
 class VLLMAdapter:
     """Production InferenceEngine adapter calling vLLM OpenAI endpoints over HTTP."""
@@ -320,6 +350,9 @@ class VLLMAdapter:
         await self.ensure_lora_loaded(replica=replica, lora_name=model_id, lora_path=lora_path)
         return True
 
+    def has_lora(self, replica_id: str, lora_name: str) -> bool:
+        return (replica_id, lora_name) in self._loaded_loras
+
     def list_replicas(self, pool: str) -> list[ReplicaEndpoint]:
         return list(self._replicas.get(pool, []))
 
@@ -366,12 +399,17 @@ class VLLMAdapter:
         resp.raise_for_status()
         data = resp.json()
         usage = data.get("usage", {})
-        content = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        message = choice.get("message") or {}
+        content = str(message.get("content") or "")
         return EngineResult(
             content=content,
             prompt_tokens=int(usage.get("prompt_tokens", 0)),
             completion_tokens=int(usage.get("completion_tokens", 0)),
             replica_id=replica.replica_id,
+            finish_reason=str(choice.get("finish_reason") or "stop"),
+            tool_calls=message.get("tool_calls"),
+            reasoning_content=message.get("reasoning_content"),
         )
 
     async def stream(
@@ -428,14 +466,20 @@ class VLLMAdapter:
                         choice = choices[0]
                         delta_obj = choice.get("delta") or {}
                         delta_text = str(delta_obj.get("content") or "")
-                        if delta_text:
+                        reasoning = delta_obj.get("reasoning_content")
+                        tool_calls = delta_obj.get("tool_calls")
+                        if delta_text or reasoning or tool_calls:
                             completion_count += 1
+                        finish_reason = choice.get("finish_reason")
                         yield _make_stream_chunk(
                             delta=delta_text,
                             fallback_count=completion_count,
                             usage=usage if isinstance(usage, dict) else None,
-                            finished=choice.get("finish_reason") is not None,
+                            finished=finish_reason is not None,
+                            finish_reason=str(finish_reason) if finish_reason is not None else None,
                             role=delta_obj.get("role"),
+                            tool_calls=tool_calls if isinstance(tool_calls, list) else None,
+                            reasoning_content=str(reasoning) if reasoning is not None else None,
                         )
                 finally:
                     entries = self._active_streams.get(request_id)
@@ -460,8 +504,11 @@ def _make_stream_chunk(
     fallback_count: int,
     usage: dict[str, Any] | None,
     finished: bool,
+    finish_reason: str | None = None,
     role: str | None = None,
     is_usage_only: bool = False,
+    tool_calls: list[dict[str, Any]] | None = None,
+    reasoning_content: str | None = None,
 ) -> StreamChunk:
     comp = int(usage.get("completion_tokens", fallback_count)) if usage else fallback_count
     prompt = int(usage["prompt_tokens"]) if usage and "prompt_tokens" in usage else None
@@ -472,16 +519,50 @@ def _make_stream_chunk(
         finished=finished,
         role=role,
         is_usage_only=is_usage_only,
+        finish_reason=finish_reason or ("stop" if finished else None),
+        tool_calls=tool_calls,
+        reasoning_content=reasoning_content,
     )
 
 
-def _estimate_prompt_tokens(messages: list[dict[str, Any]] | list[ChatMessage]) -> int:
+def _content_bytes(content: Any) -> int:
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        return len(content.encode("utf-8"))
+    return len(json.dumps(content, separators=(",", ":")).encode("utf-8"))
+
+
+def _estimate_prompt_tokens(
+    messages: list[dict[str, Any]] | list[ChatMessage],
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    response_format: dict[str, Any] | None = None,
+) -> int:
     """Conservative UTF-8 byte-ratio + ChatML framing estimate for Qwen2.5 BPE."""
     total = 0
     for msg in messages:
-        content = msg.content if isinstance(msg, ChatMessage) else str(msg.get("content", ""))
-        byte_len = len(content.encode("utf-8"))
-        total += max(1, math.ceil(byte_len / 3.0)) + 4
+        if isinstance(msg, ChatMessage):
+            byte_len = _content_bytes(msg.content)
+            if msg.name:
+                byte_len += len(msg.name.encode("utf-8"))
+            if msg.tool_calls:
+                byte_len += len(json.dumps(msg.tool_calls, separators=(",", ":")).encode("utf-8"))
+        else:
+            byte_len = _content_bytes(msg.get("content", ""))
+            if msg.get("name"):
+                byte_len += len(str(msg["name"]).encode("utf-8"))
+            if msg.get("tool_calls"):
+                byte_len += len(
+                    json.dumps(msg["tool_calls"], separators=(",", ":")).encode("utf-8")
+                )
+        total += (max(1, math.ceil(byte_len / 3.0)) if byte_len > 0 else 1) + 4
+    if tools:
+        tools_bytes = len(json.dumps(tools, separators=(",", ":")).encode("utf-8"))
+        total += max(1, math.ceil(tools_bytes / 3.0))
+    if response_format:
+        rf_bytes = len(json.dumps(response_format, separators=(",", ":")).encode("utf-8"))
+        total += max(1, math.ceil(rf_bytes / 3.0))
     return max(1, total)
 
 
@@ -601,15 +682,60 @@ def _build_upstream_payload(
     pool: ModelPoolSpec,
     tenant_id: str,
     secret: bytes,
+    effective_max_tokens: int,
 ) -> dict[str, Any]:
-    """Strip any caller-supplied cache_salt and derive an HMAC tenant salt when isolated."""
-    payload = req.model_dump()
+    """Strip caller cache_salt, enforce bounded max_tokens, and inject HMAC tenant salt."""
+    payload = req.model_dump(exclude_none=True)
     payload.pop("cache_salt", None)
+    payload.pop("max_completion_tokens", None)
+    payload["max_tokens"] = effective_max_tokens
     if pool.enable_prefix_caching and pool.isolate_prefix_cache:
         payload["cache_salt"] = hmac.new(
             secret, tenant_id.encode("utf-8"), hashlib.sha256
         ).hexdigest()
     return payload
+
+
+def _extract_bearer_token(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
+
+
+async def _fail_with_503(
+    *,
+    deps: _RuntimeDeps,
+    permit: Permit,
+    pool_name: str,
+    message: str,
+    code: str,
+) -> JSONResponse:
+    deps.admission.release()
+    await _reconcile_async(deps, permit, 0)
+    _record_status(deps, pool=pool_name, priority=str(permit.priority), status="503")
+    return _error_response(
+        message=message,
+        status_code=503,
+        error_type="server_error",
+        code=code,
+        headers={"Retry-After": "5"},
+    )
+
+
+async def _shielded_permit_cleanup(
+    deps: _RuntimeDeps, permit: Permit, *, release_admission: bool
+) -> None:
+    if release_admission:
+        deps.admission.release()
+    with anyio.CancelScope(shield=True):
+        await _reconcile_async(deps, permit, 0)
+
+
+def _sanitize_trace_id(raw: str | None) -> str:
+    if raw and _TRACE_ID_RE.fullmatch(raw):
+        return raw
+    return uuid.uuid4().hex
 
 
 def create_app(
@@ -624,6 +750,8 @@ def create_app(
     on_usage: Callable[[UsageEvent], None] | None = None,
     on_usage_flush: Callable[[], Any] | None = None,
     cache_salt_secret: bytes | None = None,
+    max_request_bytes: int = 4 * 1024 * 1024,
+    metrics_auth_token: str | None = None,
 ) -> Starlette:
     """Create the unified RequestControl ASGI application."""
     deps = _RuntimeDeps(
@@ -656,22 +784,65 @@ def create_app(
                 with suppress(asyncio.CancelledError):
                     await task
             if on_usage_flush is not None:
-                with suppress(Exception):
+                try:
                     on_usage_flush()
+                except Exception as exc:  # noqa: BLE001
+                    _LOGGER.warning("Failed to flush buffered usage events on shutdown: %s", exc)
 
-    async def metrics_endpoint(_request: Request) -> Response:
+    async def metrics_endpoint(request: Request) -> Response:
+        if metrics_auth_token is not None:
+            presented = _extract_bearer_token(request)
+            if not hmac.compare_digest(presented, metrics_auth_token):
+                return _error_response(
+                    message="Unauthorized metrics access.",
+                    status_code=401,
+                    error_type="authentication_error",
+                    code="unauthorized_metrics",
+                )
         active_metrics = deps.metrics or MetricsRegistry()
         return Response(
             content=active_metrics.render(),
             media_type=active_metrics.content_type,
         )
 
+    async def healthz_endpoint(_request: Request) -> Response:
+        return JSONResponse({"status": "ok"})
+
+    async def readyz_endpoint(_request: Request) -> Response:
+        has_replicas = any(deps.engine.list_replicas(name) for name in deps.catalog.pools)
+        if not has_replicas:
+            return JSONResponse({"status": "not_ready"}, status_code=503)
+        return JSONResponse({"status": "ready"})
+
     async def chat_completions(request: Request) -> Response:
-        trace_id = request.headers.get("x-trace-id") or uuid.uuid4().hex
+        trace_id = _sanitize_trace_id(request.headers.get("x-trace-id"))
+        internal_request_id = uuid.uuid4().hex
+        raw_cl = request.headers.get("content-length")
+        if raw_cl is not None:
+            try:
+                if int(raw_cl) > max_request_bytes:
+                    return _error_response(
+                        message=f"Request body exceeds maximum size of {max_request_bytes} bytes.",
+                        status_code=413,
+                        error_type="invalid_request_error",
+                        code="payload_too_large",
+                    )
+            except ValueError:
+                pass
+
+        raw_bytes = await request.body()
+        if len(raw_bytes) > max_request_bytes:
+            return _error_response(
+                message=f"Request body exceeds maximum size of {max_request_bytes} bytes.",
+                status_code=413,
+                error_type="invalid_request_error",
+                code="payload_too_large",
+            )
+
         try:
-            raw_body = await request.json()
+            raw_body = json.loads(raw_bytes.decode("utf-8"))
             req = ChatCompletionRequest.model_validate(raw_body)
-        except (json.JSONDecodeError, ValueError, ValidationError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, ValidationError) as exc:
             return _error_response(
                 message=f"Invalid request body: {exc}",
                 status_code=400,
@@ -691,14 +862,9 @@ def create_app(
         pool_spec = resolved.pool
         lora_spec = resolved.lora
 
-        est_prompt = _estimate_prompt_tokens(req.messages)
-        est_total = est_prompt + req.max_tokens
+        api_key = _extract_api_key(request)
         try:
-            permit = deps.budget.authorize_and_reserve(
-                _extract_api_key(request),
-                pool_spec.name,
-                est_total,
-            )
+            tenant = await anyio.to_thread.run_sync(deps.budget.authenticate, api_key)
         except AuthenticationError as exc:
             return _error_response(
                 message=str(exc),
@@ -706,12 +872,40 @@ def create_app(
                 error_type="authentication_error",
                 code="invalid_api_key",
             )
+
+        if (
+            lora_spec is not None
+            and lora_spec.tenant_id is not None
+            and tenant.tenant_id != lora_spec.tenant_id
+        ):
+            _record_status(
+                deps, pool=pool_spec.name, priority=str(tenant.priority), status="404"
+            )
+            return _error_response(
+                message=f"Unknown model alias or pool: {req.model}",
+                status_code=404,
+                error_type="invalid_request_error",
+                code="model_not_found",
+            )
+
+        est_prompt = _estimate_prompt_tokens(
+            req.messages, tools=req.tools, response_format=req.response_format
+        )
+        effective_max_tokens = min(
+            pool_spec.max_model_len,
+            req.max_completion_tokens or req.max_tokens or 256,
+        )
+        est_total = est_prompt + effective_max_tokens
+        try:
+            permit = await anyio.to_thread.run_sync(
+                deps.budget.reserve, tenant, pool_spec.name, est_total
+            )
         except BudgetExceededError as exc:
             _record_rate_limit(
                 deps,
                 pool=pool_spec.name,
-                tenant_id="unknown",
-                priority="unknown",
+                tenant_id=exc.tenant_id,
+                priority=str(exc.priority) if exc.priority is not None else "unknown",
                 reason="budget_exceeded",
             )
             return _error_response(
@@ -722,27 +916,11 @@ def create_app(
                 headers={"Retry-After": str(exc.retry_after_seconds)},
             )
 
-        if (
-            lora_spec is not None
-            and lora_spec.tenant_id is not None
-            and permit.tenant_id != lora_spec.tenant_id
-        ):
-            deps.budget.reconcile(permit, 0)
-            _record_status(
-                deps, pool=pool_spec.name, priority=str(permit.priority), status="404"
-            )
-            return _error_response(
-                message=f"Unknown model alias or pool: {req.model}",
-                status_code=404,
-                error_type="invalid_request_error",
-                code="model_not_found",
-            )
-
         t_queue = time.perf_counter()
         try:
             await deps.admission.acquire(permit.priority)
         except _AdmissionShedError as exc:
-            deps.budget.reconcile(permit, 0)
+            await _reconcile_async(deps, permit, 0)
             _record_rate_limit(
                 deps,
                 pool=pool_spec.name,
@@ -758,14 +936,14 @@ def create_app(
                 headers={"Retry-After": str(exc.retry_after_seconds)},
             )
         except BaseException:
-            deps.budget.reconcile(permit, 0)
+            await _shielded_permit_cleanup(deps, permit, release_admission=False)
             raise
         if deps.metrics is not None:
             deps.metrics.queue_wait_seconds.labels(priority=str(permit.priority)).observe(
                 max(0.0, time.perf_counter() - t_queue)
             )
 
-        target_pool, replica = _select_pool_and_replica(
+        target_pool, replica = await _select_pool_and_replica_async(
             deps=deps,
             initial_pool=pool_spec,
             messages=req.messages,
@@ -774,15 +952,12 @@ def create_app(
             tenant_id=permit.tenant_id,
         )
         if replica is None:
-            deps.admission.release()
-            deps.budget.reconcile(permit, 0)
-            _record_status(deps, pool=pool_spec.name, priority=str(permit.priority), status="503")
-            return _error_response(
+            return await _fail_with_503(
+                deps=deps,
+                permit=permit,
+                pool_name=pool_spec.name,
                 message="No healthy replicas available",
-                status_code=503,
-                error_type="server_error",
                 code="service_unavailable",
-                headers={"Retry-After": "5"},
             )
 
         if deps.metrics is not None and target_pool.name != pool_spec.name:
@@ -799,20 +974,15 @@ def create_app(
                     lora_path=f"/models/loras/{target_pool.name}/{lora_spec.name}",
                 )
             except httpx.HTTPError as exc:
-                deps.admission.release()
-                deps.budget.reconcile(permit, 0)
-                _record_status(
-                    deps, pool=target_pool.name, priority=str(permit.priority), status="503"
-                )
-                return _error_response(
+                return await _fail_with_503(
+                    deps=deps,
+                    permit=permit,
+                    pool_name=target_pool.name,
                     message=f"Failed to load dynamic LoRA adapter: {exc}",
-                    status_code=503,
-                    error_type="server_error",
                     code="lora_load_failed",
                 )
             except BaseException:
-                deps.admission.release()
-                deps.budget.reconcile(permit, 0)
+                await _shielded_permit_cleanup(deps, permit, release_admission=True)
                 raise
 
         upstream_payload = _build_upstream_payload(
@@ -820,11 +990,12 @@ def create_app(
             pool=target_pool,
             tenant_id=permit.tenant_id,
             secret=deps.cache_salt_secret,
+            effective_max_tokens=effective_max_tokens,
         )
 
         t_req = time.perf_counter()
         if req.stream:
-            return _streaming_chat_response(
+            return await _open_streaming_chat_response(
                 deps=deps,
                 request=request,
                 req=req,
@@ -836,6 +1007,7 @@ def create_app(
                 replica=replica,
                 est_prompt=est_prompt,
                 trace_id=trace_id,
+                internal_request_id=internal_request_id,
                 started_at=t_req,
             )
 
@@ -843,23 +1015,19 @@ def create_app(
             result = await deps.engine.complete(
                 replica=replica,
                 model_id=served_model,
-                request_id=trace_id,
+                request_id=internal_request_id,
                 payload=upstream_payload,
             )
         except httpx.HTTPError as exc:
-            deps.admission.release()
-            deps.budget.reconcile(permit, 0)
-            _record_status(deps, pool=target_pool.name, priority=str(permit.priority), status="503")
-            return _error_response(
+            return await _fail_with_503(
+                deps=deps,
+                permit=permit,
+                pool_name=target_pool.name,
                 message=f"Inference upstream unavailable: {exc}",
-                status_code=503,
-                error_type="server_error",
                 code="service_unavailable",
-                headers={"Retry-After": "5"},
             )
         except BaseException:
-            deps.admission.release()
-            deps.budget.reconcile(permit, 0)
+            await _shielded_permit_cleanup(deps, permit, release_admission=True)
             raise
         deps.admission.release()
 
@@ -870,16 +1038,29 @@ def create_app(
         _record_status(deps, pool=target_pool.name, priority=str(permit.priority), status="200")
 
         total_tokens = result.prompt_tokens + result.completion_tokens
-        _record_usage_and_reconcile(
-            deps=deps,
-            permit=permit,
-            pool_name=target_pool.name,
-            total_tokens=total_tokens,
-            trace_id=trace_id,
-            prompt_tokens=result.prompt_tokens,
-            completion_tokens=result.completion_tokens,
-            lora_name=lora_spec.name if lora_spec is not None else None,
+        await anyio.to_thread.run_sync(
+            lambda: _record_usage_and_reconcile(
+                deps=deps,
+                permit=permit,
+                pool_name=target_pool.name,
+                total_tokens=total_tokens,
+                trace_id=trace_id,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                lora_name=lora_spec.name if lora_spec is not None else None,
+            )
         )
+        msg_payload: dict[str, Any] = {
+            "role": "assistant",
+            "content": result.content if result.tool_calls is None or result.content else None,
+        }
+        if result.tool_calls is None:
+            msg_payload["content"] = result.content
+        else:
+            msg_payload["tool_calls"] = result.tool_calls
+        if result.reasoning_content is not None:
+            msg_payload["reasoning_content"] = result.reasoning_content
+
         return JSONResponse(
             {
                 "id": f"chatcmpl-{trace_id}",
@@ -889,8 +1070,8 @@ def create_app(
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": result.content},
-                        "finish_reason": "stop",
+                        "message": msg_payload,
+                        "finish_reason": result.finish_reason,
                     }
                 ],
                 "usage": {
@@ -907,11 +1088,52 @@ def create_app(
         routes=[
             Route("/v1/chat/completions", chat_completions, methods=["POST"]),
             Route("/metrics", metrics_endpoint, methods=["GET"]),
+            Route("/healthz", healthz_endpoint, methods=["GET"]),
+            Route("/readyz", readyz_endpoint, methods=["GET"]),
         ],
     )
 
 
-def _streaming_chat_response(
+async def _reconcile_async(deps: _RuntimeDeps, permit: Permit, actual_tokens: int) -> None:
+    await anyio.to_thread.run_sync(deps.budget.reconcile, permit, actual_tokens)
+
+
+def _format_sse_chunk(
+    *,
+    chunk: StreamChunk,
+    trace_id: str,
+    created: int,
+    served_model: str,
+) -> str:
+    delta_obj: dict[str, Any] = {}
+    if chunk.role is not None:
+        delta_obj["role"] = chunk.role
+    if chunk.delta or chunk.role is not None:
+        delta_obj["content"] = chunk.delta
+    if chunk.reasoning_content is not None:
+        delta_obj["reasoning_content"] = chunk.reasoning_content
+    if chunk.tool_calls is not None:
+        delta_obj["tool_calls"] = chunk.tool_calls
+    finish_reason = chunk.finish_reason if chunk.finished else None
+    if chunk.finished and finish_reason is None:
+        finish_reason = "stop"
+    payload = {
+        "id": f"chatcmpl-{trace_id}",
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": served_model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta_obj,
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+async def _open_streaming_chat_response(
     *,
     deps: _RuntimeDeps,
     request: Request,
@@ -924,31 +1146,66 @@ def _streaming_chat_response(
     replica: ReplicaEndpoint,
     est_prompt: int,
     trace_id: str,
+    internal_request_id: str,
     started_at: float = 0.0,
-) -> StreamingResponse:
+) -> Response:
     include_usage = bool(
         req.stream_options and req.stream_options.get("include_usage", False)
     )
     created = int(time.time())
+    stream_iter = deps.engine.stream(
+        replica=replica,
+        model_id=served_model,
+        request_id=internal_request_id,
+        payload=upstream_payload,
+    )
+
+    first_chunk: StreamChunk | None = None
+    try:
+        first_chunk = await stream_iter.__anext__()
+    except StopAsyncIteration:
+        first_chunk = None
+    except httpx.HTTPError as exc:
+        with anyio.CancelScope(shield=True):
+            aclose = getattr(stream_iter, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        return await _fail_with_503(
+            deps=deps,
+            permit=permit,
+            pool_name=target_pool.name,
+            message=f"Inference upstream unavailable: {exc}",
+            code="service_unavailable",
+        )
+    except BaseException:
+        with anyio.CancelScope(shield=True):
+            aclose = getattr(stream_iter, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        await _shielded_permit_cleanup(deps, permit, release_admission=True)
+        raise
 
     async def event_stream() -> AsyncIterator[str]:
         completed = False
+        upstream_failed = False
         emitted_tokens = 0
         actual_prompt_tokens: int | None = None
         recorded_ttft = False
-        stream_iter = deps.engine.stream(
-            replica=replica,
-            model_id=served_model,
-            request_id=trace_id,
-            payload=upstream_payload,
-        )
+
+        async def _iter_chunks() -> AsyncIterator[StreamChunk]:
+            if first_chunk is not None:
+                yield first_chunk
+            async for nxt in stream_iter:
+                yield nxt
+
         try:
-            async for chunk in stream_iter:
+            async for chunk in _iter_chunks():
                 if await request.is_disconnected():
                     break
+                has_output = bool(chunk.delta or chunk.reasoning_content or chunk.tool_calls)
                 should_record_ttft = (
                     not recorded_ttft
-                    and bool(chunk.delta)
+                    and has_output
                     and deps.metrics is not None
                     and started_at > 0
                 )
@@ -962,25 +1219,12 @@ def _streaming_chat_response(
                     actual_prompt_tokens = chunk.prompt_tokens
                 if chunk.is_usage_only:
                     continue
-                delta_obj: dict[str, Any] = {}
-                if chunk.role is not None:
-                    delta_obj["role"] = chunk.role
-                if chunk.delta or chunk.role is not None:
-                    delta_obj["content"] = chunk.delta
-                payload = {
-                    "id": f"chatcmpl-{trace_id}",
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": served_model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": delta_obj,
-                            "finish_reason": "stop" if chunk.finished else None,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(payload)}\n\n"
+                yield _format_sse_chunk(
+                    chunk=chunk,
+                    trace_id=trace_id,
+                    created=created,
+                    served_model=served_model,
+                )
             else:
                 completed = True
                 if deps.metrics is not None:
@@ -1005,6 +1249,19 @@ def _streaming_chat_response(
                     }
                     yield f"data: {json.dumps(usage_payload)}\n\n"
                 yield "data: [DONE]\n\n"
+        except httpx.HTTPError as exc:
+            upstream_failed = True
+            _record_status(deps, pool=target_pool.name, priority=str(permit.priority), status="503")
+            err_payload = {
+                "error": {
+                    "message": f"Upstream inference error mid-stream: {exc}",
+                    "type": "server_error",
+                    "param": None,
+                    "code": "service_unavailable",
+                }
+            }
+            yield f"data: {json.dumps(err_payload)}\n\n"
+            yield "data: [DONE]\n\n"
         finally:
             try:
                 if not completed:
@@ -1012,22 +1269,30 @@ def _streaming_chat_response(
                         aclose = getattr(stream_iter, "aclose", None)
                         if aclose is not None:
                             await aclose()
-                        await deps.engine.abort(replica=replica, request_id=trace_id)
+                        await deps.engine.abort(replica=replica, request_id=internal_request_id)
             finally:
-                prompt_used = (
-                    actual_prompt_tokens if actual_prompt_tokens is not None else est_prompt
-                )
-                _record_usage_and_reconcile(
-                    deps=deps,
-                    permit=permit,
-                    pool_name=target_pool.name,
-                    total_tokens=prompt_used + emitted_tokens,
-                    trace_id=trace_id,
-                    prompt_tokens=prompt_used,
-                    completion_tokens=emitted_tokens,
-                    lora_name=lora_name,
-                )
-                deps.admission.release()
+                with anyio.CancelScope(shield=True):
+                    if upstream_failed and emitted_tokens == 0:
+                        await _reconcile_async(deps, permit, 0)
+                    else:
+                        prompt_used = (
+                            actual_prompt_tokens
+                            if actual_prompt_tokens is not None
+                            else est_prompt
+                        )
+                        await anyio.to_thread.run_sync(
+                            lambda: _record_usage_and_reconcile(
+                                deps=deps,
+                                permit=permit,
+                                pool_name=target_pool.name,
+                                total_tokens=prompt_used + emitted_tokens,
+                                trace_id=trace_id,
+                                prompt_tokens=prompt_used,
+                                completion_tokens=emitted_tokens,
+                                lora_name=lora_name,
+                            )
+                        )
+                    deps.admission.release()
 
     return StreamingResponse(
         event_stream(),
@@ -1039,8 +1304,13 @@ def _streaming_chat_response(
 def _extract_prefix(messages: list[ChatMessage]) -> str:
     for msg in messages:
         if msg.role == "system":
-            return msg.content[:256]
-    return messages[0].content[:256] if messages else ""
+            text_val = msg.content if isinstance(msg.content, str) else json.dumps(msg.content)
+            return text_val[:256]
+    if not messages:
+        return ""
+    first = messages[0].content
+    text_val = first if isinstance(first, str) else json.dumps(first)
+    return text_val[:256]
 
 
 def _hash64(value: str) -> int:
@@ -1053,6 +1323,8 @@ def _pick_replica(
     prefix: str,
     *,
     epsilon: float = 0.25,
+    has_lora_fn: Callable[[str, str], bool] | None = None,
+    lora_name: str | None = None,
 ) -> ReplicaEndpoint:
     """Consistent Hashing with Bounded Loads (CHWBL) across replica virtual nodes."""
     by_id = {r.replica_id: r for r in replicas}
@@ -1072,6 +1344,7 @@ def _pick_replica(
     ring_hashes = [h for h, _ in ring]
     start_idx = bisect.bisect_left(ring_hashes, _hash64(prefix))
     visited: set[str] = set()
+    eligible: list[ReplicaEndpoint] = []
     for offset in range(len(ring)):
         rep_id = ring[(start_idx + offset) % len(ring)][1]
         if rep_id in visited:
@@ -1082,9 +1355,14 @@ def _pick_replica(
             candidate.requests_waiting <= waiting_cap
             and candidate.kv_cache_usage <= pool.keda_kv_cache_threshold
         ):
-            return candidate
+            if lora_name is None or has_lora_fn is None or has_lora_fn(rep_id, lora_name):
+                return candidate
+            eligible.append(candidate)
         if len(visited) == len(by_id):
             break
+
+    if eligible:
+        return eligible[0]
 
     return min(
         replicas,
@@ -1092,7 +1370,7 @@ def _pick_replica(
     )
 
 
-def _select_pool_and_replica(
+async def _select_pool_and_replica_async(
     *,
     deps: _RuntimeDeps,
     initial_pool: ModelPoolSpec,
@@ -1107,13 +1385,19 @@ def _select_pool_and_replica(
     seen: set[str] = set()
     while curr is not None and curr.name not in seen:
         seen.add(curr.name)
-        status = deps.pool_health.get_state(curr.name)
+        status = await anyio.to_thread.run_sync(deps.pool_health.get_state, curr.name)
         replicas = deps.engine.list_replicas(curr.name)
         if status.state == HealthState.HEALTHY and replicas:
             routing_key = (
                 f"{tenant_id}:{base_key}" if curr.isolate_prefix_cache and tenant_id else base_key
             )
-            return curr, _pick_replica(curr, replicas, routing_key)
+            return curr, _pick_replica(
+                curr,
+                replicas,
+                routing_key,
+                has_lora_fn=deps.engine.has_lora,
+                lora_name=lora_name,
+            )
         if not allow_fallback:
             break
         curr = deps.catalog.pools.get(curr.fallback_pool) if curr.fallback_pool else None

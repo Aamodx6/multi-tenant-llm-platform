@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator, MutableMapping
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -348,7 +349,9 @@ async def test_sse_streaming_passthrough_and_client_disconnect_aborts_engine() -
         await app(scope, receive, send)
         engine.stream_gate = None
 
-        assert engine.aborted == [("8b-0", "trace-abort")]
+        assert len(engine.aborted) == 1
+        assert engine.aborted[0][0] == "8b-0"
+        assert engine.aborted[0][1] != "trace-abort"  # Gateway-owned internal request_id
         # Full stream used 7+3=10 tokens, aborted stream used 5+1=6 tokens -> 84 left
         tail = await client.post(
             "/v1/chat/completions",
@@ -1036,3 +1039,251 @@ async def test_upstream_http_error_returns_503_and_refunds_budget() -> None:
             },
         )
         assert r2.status_code == 503
+
+
+@pytest.mark.anyio
+async def test_quota_smuggling_blocked_body_limit_trace_sanitization_and_metrics_auth() -> None:
+    catalog = load_and_validate(CATALOG_YAML)
+    tenant = TenantRecord("acme", PriorityClass.PAID, tpm_limit=100, max_concurrency=2)
+    engine = FakeEngineAdapter(
+        replicas={"pool-8b": [ReplicaEndpoint("8b-0", "http://8b-0:8000")]},
+        completion_tokens=5,
+    )
+    app = create_app(
+        catalog=catalog,
+        budget=TenantBudget(adapter=InMemoryBudgetAdapter({hash_api_key("sk-acme"): tenant})),
+        pool_health=PoolHealthStore(),
+        engine=engine,
+        max_request_bytes=1024,
+        metrics_auth_token="metrics-secret",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        # 1. Extra undocumented vLLM knob like best_of must be rejected (400)
+        extra_knob = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme"},
+            json={
+                "model": "qwen-7b",
+                "best_of": 8,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert extra_knob.status_code == 400
+
+        # 2. max_completion_tokens overrides max_tokens in reservation -> 429
+        mct_over = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme"},
+            json={
+                "model": "qwen-7b",
+                "max_tokens": 10,
+                "max_completion_tokens": 98,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert mct_over.status_code == 429
+
+        # 3. n > 1 is rejected cleanly (400) so quota cannot multiply or drop choices
+        n_over = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme"},
+            json={
+                "model": "qwen-7b",
+                "max_tokens": 30,
+                "n": 4,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert n_over.status_code == 400
+
+        # 3b. Omitting max_tokens still injects bounded max_tokens=256 upstream
+        omitted_max = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme"},
+            json={
+                "model": "qwen-7b",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert omitted_max.status_code == 429  # 256 default > 100 TPM budget
+
+        # 4. Large tools schema is counted in prompt token estimation -> 429
+        tools_over = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme"},
+            json={
+                "model": "qwen-7b",
+                "max_tokens": 10,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "big_tool",
+                            "description": "x" * 350,
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert tools_over.status_code == 429
+
+        # 5. Oversized request body returns 413
+        too_big = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme"},
+            json={
+                "model": "qwen-7b",
+                "messages": [{"role": "user", "content": "a" * 1500}],
+            },
+        )
+        assert too_big.status_code == 413
+
+        # 6. Unsafe x-trace-id is replaced by a valid generated ID
+        forged = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme", "x-trace-id": "bad\nid/../../"},
+            json={
+                "model": "qwen-7b",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert forged.status_code == 200
+        assert "\n" not in forged.headers["x-trace-id"]
+        assert "/" not in forged.headers["x-trace-id"]
+
+        # 7. /metrics enforces bearer token when configured, /healthz is open
+        assert (await client.get("/metrics")).status_code == 401
+        assert (
+            await client.get("/metrics", headers={"Authorization": "Bearer metrics-secret"})
+        ).status_code == 200
+        assert (await client.get("/healthz")).status_code == 200
+
+
+@pytest.mark.anyio
+async def test_vllm_tool_calls_reasoning_and_stream_preflight_503() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("stream"):
+            return httpx.Response(500, json={"error": {"message": "vllm crash"}})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning_content": "thinking",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "get_weather", "arguments": "{}"},
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 4},
+            },
+        )
+
+    catalog = load_and_validate(CATALOG_YAML)
+    tenant = TenantRecord("acme", PriorityClass.PAID, tpm_limit=200, max_concurrency=1)
+    vllm = VLLMAdapter(
+        replicas={"pool-8b": [ReplicaEndpoint("8b-0", "http://vllm-0:8000")]},
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    app = create_app(
+        catalog=catalog,
+        budget=TenantBudget(adapter=InMemoryBudgetAdapter({hash_api_key("sk-acme"): tenant})),
+        pool_health=PoolHealthStore(),
+        engine=vllm,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        # Non-streaming tool_calls with content=None must succeed and preserve finish_reason
+        tc = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme"},
+            json={
+                "model": "qwen-7b",
+                "max_tokens": 50,
+                "messages": [{"role": "user", "content": "weather?"}],
+            },
+        )
+        assert tc.status_code == 200
+        choice = tc.json()["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        assert choice["message"]["tool_calls"][0]["id"] == "call_1"
+
+        # Streaming upstream 500 must fail BEFORE 200 OK with 503 and refund budget
+        st_err = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme"},
+            json={
+                "model": "qwen-7b",
+                "max_tokens": 120,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert st_err.status_code == 503
+
+        # Budget & concurrency slot were refunded -> subsequent call is not 429
+        after = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-acme"},
+            json={
+                "model": "qwen-7b",
+                "max_tokens": 120,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert after.status_code == 200
+
+
+def test_server_fail_closed_in_production_and_db_tenant_lookup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from sqlalchemy import create_engine, text
+
+    from gateway.server import create_default_app
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("CACHE_SALT_SECRET", "prod-secret")
+    monkeypatch.delenv("TENANTS_JSON", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    with pytest.raises(RuntimeError, match="production"):
+        create_default_app()
+
+    db_file = tmp_path / "tenants.db"
+    db_url = f"sqlite:///{db_file}"
+    eng = create_engine(db_url)
+    with eng.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE tenants ("
+                "key_hash TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, "
+                "priority TEXT NOT NULL, tpm_limit INTEGER NOT NULL, "
+                "max_concurrency INTEGER NOT NULL, revoked_at TEXT)"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO tenants VALUES (:kh, 'pg-tenant', 'paid', 5000, 4, NULL)"
+            ),
+            {"kh": hash_api_key("sk-pg-live")},
+        )
+
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    app = create_default_app()
+    assert app is not None

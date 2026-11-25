@@ -10,5 +10,5 @@ variable "cluster_name" {
 
 variable "model_bucket_name" {
   type    = string
-  default = "multi-tenant-llm-models-prod"
+  default = "llm-model-weights"
 }

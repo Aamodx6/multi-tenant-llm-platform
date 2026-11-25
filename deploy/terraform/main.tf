@@ -44,7 +44,8 @@ module "eks" {
   vpc_id          = module.vpc.vpc_id
   subnet_ids      = module.vpc.private_subnets
 
-  cluster_endpoint_public_access = true
+  cluster_endpoint_public_access  = true
+  cluster_endpoint_private_access = true
 
   eks_managed_node_groups = {
     system = {
@@ -60,8 +61,32 @@ module "eks" {
   }
 }
 
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = module.vpc.vpc_id
+  service_name      = "com.amazonaws.${var.aws_region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = module.vpc.private_route_table_ids
+}
+
 resource "aws_s3_bucket" "model_weights" {
   bucket = var.model_bucket_name
+}
+
+resource "aws_s3_bucket_public_access_block" "model_weights" {
+  bucket                  = aws_s3_bucket.model_weights.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "model_weights" {
+  bucket = aws_s3_bucket.model_weights.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
 }
 
 resource "aws_s3_bucket_versioning" "model_weights" {
@@ -69,4 +94,42 @@ resource "aws_s3_bucket_versioning" "model_weights" {
   versioning_configuration {
     status = "Enabled"
   }
+}
+
+data "aws_iam_policy_document" "weight_prefetch_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole", "sts:TagSession"]
+    principals {
+      type        = "Service"
+      identifiers = ["pods.eks.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "weight_prefetch" {
+  name               = "${var.cluster_name}-weight-prefetch"
+  assume_role_policy = data.aws_iam_policy_document.weight_prefetch_assume.json
+}
+
+resource "aws_iam_role_policy" "weight_prefetch_s3" {
+  name = "s3-model-weights-read"
+  role = aws_iam_role.weight_prefetch.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:ListBucket"]
+        Resource = [aws_s3_bucket.model_weights.arn, "${aws_s3_bucket.model_weights.arn}/*"]
+      }
+    ]
+  })
+}
+
+resource "aws_eks_pod_identity_association" "weight_prefetch" {
+  cluster_name    = module.eks.cluster_name
+  namespace       = "llm"
+  service_account = "weight-prefetcher"
+  role_arn        = aws_iam_role.weight_prefetch.arn
 }

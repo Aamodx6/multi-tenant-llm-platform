@@ -27,6 +27,8 @@ class WorkloadProfile(BaseModel):
     user_prompt_prefix: str = "Explain Kubernetes scheduling for GPU workloads"
     gpu_hourly_usd: float = Field(default=0.50, gt=0.0)
     slo_p95_ttft_ms: float = Field(default=1000.0, gt=0.0)
+    min_success_rate: float = Field(default=0.99, ge=0.0, le=1.0)
+    max_itl_p95_ms: float | None = Field(default=None, gt=0.0)
     max_ttft_regression_pct: float = Field(default=15.0, ge=0.0)
     min_throughput_ratio: float = Field(default=0.85, gt=0.0, le=1.0)
 
@@ -315,9 +317,19 @@ def _evaluate_verdict(
     reasons: list[str] = []
     if report.succeeded == 0:
         reasons.append("Zero successful requests recorded.")
+    elif report.total_requests > 0:
+        success_rate = report.succeeded / report.total_requests
+        if success_rate < profile.min_success_rate:
+            reasons.append(
+                f"Success rate {success_rate:.3f} below minimum {profile.min_success_rate:.3f}."
+            )
     if report.ttft_ms_p95 > profile.slo_p95_ttft_ms:
         reasons.append(
             f"p95 TTFT {report.ttft_ms_p95:.1f}ms exceeds SLO {profile.slo_p95_ttft_ms:.1f}ms."
+        )
+    if profile.max_itl_p95_ms is not None and report.itl_ms_p95 > profile.max_itl_p95_ms:
+        reasons.append(
+            f"p95 ITL {report.itl_ms_p95:.1f}ms exceeds max {profile.max_itl_p95_ms:.1f}ms."
         )
     if baseline is not None:
         max_allowed_ttft = baseline.ttft_ms_p95 * (1.0 + profile.max_ttft_regression_pct / 100.0)

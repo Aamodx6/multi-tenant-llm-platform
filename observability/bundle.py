@@ -141,6 +141,12 @@ def render_observability_bundle(catalog: ModelPoolCatalog) -> dict[str, str]:
                                 "image": "nvcr.io/nvidia/k8s/dcgm-exporter:3.3.8-3.6.0-ubuntu22.04",
                                 "args": ["-f", "/etc/dcgm-exporter/counters.csv"],
                                 "ports": [{"containerPort": 9400, "name": "metrics"}],
+                                "securityContext": {
+                                    "capabilities": {
+                                        "add": ["SYS_ADMIN"],
+                                        "drop": ["ALL"],
+                                    }
+                                },
                                 "volumeMounts": [
                                     {
                                         "name": "counters",
@@ -155,6 +161,15 @@ def render_observability_bundle(catalog: ModelPoolCatalog) -> dict[str, str]:
                         ],
                     },
                 },
+            },
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "dcgm-exporter", "namespace": "monitoring"},
+            "spec": {
+                "selector": {"app": "dcgm-exporter"},
+                "ports": [{"name": "metrics", "port": 9400, "targetPort": 9400}],
             },
         },
     ]

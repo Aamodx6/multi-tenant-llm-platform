@@ -15,6 +15,9 @@ spec:
         app: weight-prefetch
     spec:
       serviceAccountName: weight-prefetcher
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       nodeSelector:
         nvidia.com/gpu.present: 'true'
       tolerations:
@@ -28,6 +31,11 @@ spec:
         - cp
         - /s5cmd
         - /tools/s5cmd
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
         volumeMounts:
         - name: tools
           mountPath: /tools
@@ -37,37 +45,31 @@ spec:
         command:
         - /bin/sh
         - -c
-        - set -eu; (mkdir -p /models/.locks /models/.staging && lock_name=$(printf
-          '%s' 'qwen--qwen2.5-7b-instruct' | tr '/' '_') && flock "/models/.locks/${lock_name}.lock"
-          /bin/sh -c 'if [ ! -f /models/qwen--qwen2.5-7b-instruct/.ready ]; then stage="/models/.staging/${lock_name}.$$";
-          trap "rm -rf \"$stage\"" EXIT; mkdir -p "$stage" && /tools/s5cmd cp --concurrency
-          32 "s3://llm-model-weights/Qwen/Qwen2.5-7B-Instruct/*" "$stage/" && (ls
-          "$stage"/*.safetensors >/dev/null 2>&1 || ls "$stage"/adapter_model* >/dev/null
-          2>&1) && touch "$stage/.ready" && mkdir -p "$(dirname /models/qwen--qwen2.5-7b-instruct)"
-          && rm -rf "/models/qwen--qwen2.5-7b-instruct.old" && ([ ! -e "/models/qwen--qwen2.5-7b-instruct"
-          ] || mv "/models/qwen--qwen2.5-7b-instruct" "/models/qwen--qwen2.5-7b-instruct.old")
-          && mv "$stage" "/models/qwen--qwen2.5-7b-instruct" && rm -rf "/models/qwen--qwen2.5-7b-instruct.old"
-          && trap - EXIT; fi') && (mkdir -p /models/.locks /models/.staging && lock_name=$(printf
-          '%s' 'qwen--qwen2.5-7b-instruct-awq' | tr '/' '_') && flock "/models/.locks/${lock_name}.lock"
-          /bin/sh -c 'if [ ! -f /models/qwen--qwen2.5-7b-instruct-awq/.ready ]; then
-          stage="/models/.staging/${lock_name}.$$"; trap "rm -rf \"$stage\"" EXIT;
-          mkdir -p "$stage" && /tools/s5cmd cp --concurrency 32 "s3://llm-model-weights/Qwen/Qwen2.5-7B-Instruct-AWQ/*"
-          "$stage/" && (ls "$stage"/*.safetensors >/dev/null 2>&1 || ls "$stage"/adapter_model*
-          >/dev/null 2>&1) && touch "$stage/.ready" && mkdir -p "$(dirname /models/qwen--qwen2.5-7b-instruct-awq)"
-          && rm -rf "/models/qwen--qwen2.5-7b-instruct-awq.old" && ([ ! -e "/models/qwen--qwen2.5-7b-instruct-awq"
-          ] || mv "/models/qwen--qwen2.5-7b-instruct-awq" "/models/qwen--qwen2.5-7b-instruct-awq.old")
-          && mv "$stage" "/models/qwen--qwen2.5-7b-instruct-awq" && rm -rf "/models/qwen--qwen2.5-7b-instruct-awq.old"
-          && trap - EXIT; fi') && (mkdir -p /models/.locks /models/.staging && lock_name=$(printf
-          '%s' 'qwen--qwen2.5-1.5b-instruct' | tr '/' '_') && flock "/models/.locks/${lock_name}.lock"
-          /bin/sh -c 'if [ ! -f /models/qwen--qwen2.5-1.5b-instruct/.ready ]; then
-          stage="/models/.staging/${lock_name}.$$"; trap "rm -rf \"$stage\"" EXIT;
-          mkdir -p "$stage" && /tools/s5cmd cp --concurrency 32 "s3://llm-model-weights/Qwen/Qwen2.5-1.5B-Instruct/*"
-          "$stage/" && (ls "$stage"/*.safetensors >/dev/null 2>&1 || ls "$stage"/adapter_model*
-          >/dev/null 2>&1) && touch "$stage/.ready" && mkdir -p "$(dirname /models/qwen--qwen2.5-1.5b-instruct)"
-          && rm -rf "/models/qwen--qwen2.5-1.5b-instruct.old" && ([ ! -e "/models/qwen--qwen2.5-1.5b-instruct"
-          ] || mv "/models/qwen--qwen2.5-1.5b-instruct" "/models/qwen--qwen2.5-1.5b-instruct.old")
-          && mv "$stage" "/models/qwen--qwen2.5-1.5b-instruct" && rm -rf "/models/qwen--qwen2.5-1.5b-instruct.old"
-          && trap - EXIT; fi'); exec sleep infinity
+        - "set -eu\nmkdir -p /models/.locks /models/.staging\nprintf \"%s\\n\" \"\
+          $PREFETCH_TARGETS\" | while IFS=\"$(printf '\\t')\" read -r rel uri; do\n\
+          \  [ -n \"$rel\" ] || continue\n  lock_name=$(printf \"%s\" \"$rel\" | tr\
+          \ \"/\" \"_\")\n  flock \"/models/.locks/${lock_name}.lock\" /bin/sh -c\
+          \ '\n    rel=\"$1\"; uri=\"$2\"; lock_name=\"$3\"\n    if [ ! -f \"/models/${rel}/.ready\"\
+          \ ]; then\n      stage=\"/models/.staging/${lock_name}.$$\"\n      trap\
+          \ \"rm -rf \\\"$stage\\\"\" EXIT\n      mkdir -p \"$stage\"\n      /tools/s5cmd\
+          \ cp --concurrency 32 \"${uri}/*\" \"$stage/\"\n      (ls \"$stage\"/*.safetensors\
+          \ >/dev/null 2>&1 || ls \"$stage\"/adapter_model* >/dev/null 2>&1)\n   \
+          \   touch \"$stage/.ready\"\n      mkdir -p \"$(dirname \"/models/${rel}\"\
+          )\"\n      rm -rf \"/models/${rel}.old\"\n      ([ ! -e \"/models/${rel}\"\
+          \ ] || mv \"/models/${rel}\" \"/models/${rel}.old\")\n      mv \"$stage\"\
+          \ \"/models/${rel}\"\n      rm -rf \"/models/${rel}.old\"\n      trap -\
+          \ EXIT\n    fi\n  ' sh \"$rel\" \"$uri\" \"$lock_name\"\ndone\nexec sleep\
+          \ infinity"
+        env:
+        - name: PREFETCH_TARGETS
+          value: "qwen--qwen2.5-7b-instruct\ts3://llm-model-weights/Qwen/Qwen2.5-7B-Instruct\n\
+            qwen--qwen2.5-7b-instruct-awq\ts3://llm-model-weights/Qwen/Qwen2.5-7B-Instruct-AWQ\n\
+            qwen--qwen2.5-1.5b-instruct\ts3://llm-model-weights/Qwen/Qwen2.5-1.5B-Instruct"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
         volumeMounts:
         - name: model-cache
           mountPath: /models

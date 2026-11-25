@@ -200,3 +200,12 @@ def test_render_observability_bundle_generates_valid_alerts_dcgm_and_grafana() -
 
     dashboard = json.loads(bundle["grafana-dashboard.json"])
     assert len(dashboard["panels"]) >= 4
+
+    dcgm_docs = list(yaml.safe_load_all(bundle["dcgm-daemonset.yaml"]))
+    dcgm_ds = next(d for d in dcgm_docs if d["kind"] == "DaemonSet")
+    dcgm_svc = next(d for d in dcgm_docs if d["kind"] == "Service")
+    dcgm_caps = dcgm_ds["spec"]["template"]["spec"]["containers"][0]["securityContext"][
+        "capabilities"
+    ]["add"]
+    assert "SYS_ADMIN" in dcgm_caps
+    assert dcgm_svc["spec"]["ports"][0]["port"] == 9400
